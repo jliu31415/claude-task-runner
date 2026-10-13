@@ -27,7 +27,7 @@ on:
         required: false
       CLAUDE_CODE_OAUTH_TOKEN:
         required: false
-      SETUP_TOKEN:
+      SETUP_GH_TOKEN:
         description: Exposed as GH_TOKEN to the project's setup script only
         required: false
 
@@ -50,6 +50,8 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+      # only used when .claude-task/config sets up workload identity federation
+      id-token: write
     outputs:
       has_changes: ${{ steps.collect.outputs.has_changes }}
     steps:
@@ -84,7 +86,7 @@ jobs:
 
       - name: Project setup
         env:
-          GH_TOKEN: ${{ secrets.SETUP_TOKEN }}
+          GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}
         run: '"$CT_CI" hook setup'
 
       - name: Run Claude

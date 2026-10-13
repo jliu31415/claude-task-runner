@@ -14,6 +14,11 @@ source "$CT_LIB/common.sh"
 CT_CLAUDE_CODE_VERSION=2.1.296
 CT_CLAUDE_TOOLS=Read,Edit,Write,Glob,Grep,Bash,TodoWrite
 CT_DEFAULT_PROTECTED=".github/ .claude/ $CT_DIR/"
+CT_OIDC_AUDIENCE=https://api.anthropic.com
+# GitHub's identity tokens live about 5 minutes; the CLI re-reads the file whenever it refreshes
+CT_OIDC_REFRESH_SECONDS=${CT_OIDC_REFRESH_SECONDS:-120}
+# the job may hold id-token: write; untrusted code (hooks, Claude) runs without the request vars
+CT_NO_OIDC=(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN)
 
 : "${CT_CONF:?}" "${CT_WORK:?}" "${CT_OUT:?}"
 : "${CT_SNAPSHOT_REF:?}" "${CT_SNAPSHOT_SHA:?}" "${CT_PROMPT_PATH:?}" "${CT_TASK_NAME:?}" "${CT_TASK_ID:?}"
@@ -116,7 +121,7 @@ phase_hook() {
   [[ -x $CT_WORK/$script ]] || ct_die "$script is not executable"
 
   echo "running $which hook: $script"
-  (cd "$CT_WORK" && "./$script") || ct_die "$which hook $script failed"
+  (cd "$CT_WORK" && "${CT_NO_OIDC[@]}" "./$script") || ct_die "$which hook $script failed"
 
   if [[ $which == setup ]]; then
     dirty="$(git -C "$CT_WORK" status --porcelain --untracked-files=all)"
@@ -127,16 +132,58 @@ phase_hook() {
   fi
 }
 
+# writes a fresh GitHub OIDC token for the Anthropic audience to $1, atomically and without echoing it
+fetch_oidc_token() {
+  local dest=$1 tmp token
+  tmp="$dest.tmp"
+  token="$(curl -sS --fail -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$CT_OIDC_AUDIENCE" | jq -r '.value // empty')" || return 1
+  [[ -n $token ]] || return 1
+  (umask 077 && printf '%s' "$token" > "$tmp") && mv -f "$tmp" "$dest"
+}
+
+# Workload identity federation: when .claude-task/config names a federation rule, Claude Code
+# exchanges the job's GitHub OIDC token for a short-lived Anthropic token instead of using a key.
+setup_wif() {
+  local key val
+  for key in ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID ANTHROPIC_SERVICE_ACCOUNT_ID ANTHROPIC_WORKSPACE_ID; do
+    val="$(conf "$key")"
+    [[ -z $val || $val =~ ^[A-Za-z0-9_-]+$ ]] || ct_die "$key in $CT_CONF_PATH has unexpected characters"
+    if [[ -n $val ]]; then export "$key=$val"; else unset "$key"; fi
+  done
+  [[ -n ${ANTHROPIC_ORGANIZATION_ID-} ]] || ct_die "ANTHROPIC_FEDERATION_RULE_ID needs ANTHROPIC_ORGANIZATION_ID in $CT_CONF_PATH"
+  [[ -n ${ACTIONS_ID_TOKEN_REQUEST_URL-} && -n ${ACTIONS_ID_TOKEN_REQUEST_TOKEN-} ]] \
+    || ct_die "workload identity federation needs 'id-token: write' on the calling job (rerun 'submit-task init' for a current workflow)"
+  # a configured rule wins; a stray key secret would otherwise take precedence in the CLI
+  unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+  export ANTHROPIC_IDENTITY_TOKEN_FILE="$CT_TMP/oidc-token"
+  fetch_oidc_token "$ANTHROPIC_IDENTITY_TOKEN_FILE" || ct_die "couldn't get a GitHub OIDC token"
+  (
+    while sleep "$CT_OIDC_REFRESH_SECONDS"; do
+      fetch_oidc_token "$ANTHROPIC_IDENTITY_TOKEN_FILE" || ct_warn "refreshing the GitHub OIDC token failed"
+    done
+  ) &
+  CT_OIDC_REFRESHER=$!
+  echo "authenticating with workload identity federation (rule $ANTHROPIC_FEDERATION_RULE_ID)"
+}
+
 phase_claude() {
   local bin=${CLAUDE_BIN:-} budget model instructions status result is_error
-  [[ -n ${ANTHROPIC_API_KEY:-}${CLAUDE_CODE_OAUTH_TOKEN:-} ]] \
-    || ct_die "set the ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN secret"
+  CT_TMP="$(mktemp -d)"
+  CT_OIDC_REFRESHER=""
+  trap '[[ -z $CT_OIDC_REFRESHER ]] || kill "$CT_OIDC_REFRESHER" 2>/dev/null; rm -rf "$CT_TMP"' EXIT
+  if [[ -n $(conf ANTHROPIC_FEDERATION_RULE_ID) ]]; then
+    setup_wif
+  else
+    [[ -n ${ANTHROPIC_API_KEY:-}${CLAUDE_CODE_OAUTH_TOKEN:-} ]] \
+      || ct_die "set the ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN secret, or configure workload identity federation"
+  fi
   if [[ -z $bin ]]; then
     npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@$CT_CLAUDE_CODE_VERSION"
     bin=claude
   fi
 
-  instructions="$(mktemp)"
+  instructions="$CT_TMP/instructions.md"
   {
     cat "$CT_LIB/instructions.md"
     printf '\nProtected paths (changing any of them fails the task): %s\n' "$(protected_paths)"
@@ -156,7 +203,7 @@ phase_claude() {
   [[ -n $model ]] && args+=(--model "$model")
 
   set +e
-  (cd "$CT_WORK" && "$bin" "${args[@]}" < "$CT_OUT/prompt.md") \
+  (cd "$CT_WORK" && "${CT_NO_OIDC[@]}" "$bin" "${args[@]}" < "$CT_OUT/prompt.md") \
     | tee -p "$CT_OUT/transcript.jsonl" \
     | jq -R --unbuffered -r 'fromjson? | select(.type == "assistant") | .message.content[]?
         | if .type == "text" then .text
@@ -164,7 +211,6 @@ phase_claude() {
           else empty end'
   status=${PIPESTATUS[0]}
   set -e
-  rm -f "$instructions"
 
   result="$(jq -R -c 'fromjson? | select(.type == "result")' "$CT_OUT/transcript.jsonl" | tail -n1)"
   [[ -n $result ]] || ct_die "Claude exited with status $status and produced no result"

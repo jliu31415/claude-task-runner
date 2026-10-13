@@ -34,6 +34,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      id-token: write
     uses: @RUNNER_SLUG@/.github/workflows/claude-task-run.yml@@RUNNER_SHA@ # @RUNNER_VERSION@
     with:
       snapshot_ref: ${{ inputs.snapshot_ref }}
@@ -42,7 +43,8 @@ jobs:
       task_name: ${{ inputs.task_name }}
       task_id: ${{ inputs.task_id }}
     secrets:
+      # not needed with workload identity federation (.claude-task/config)
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       # optional: handed to the setup script as GH_TOKEN, e.g. to read private release assets
-      SETUP_TOKEN: ${{ secrets.SETUP_TOKEN }}
+      SETUP_GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}

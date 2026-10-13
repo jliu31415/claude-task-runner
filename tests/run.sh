@@ -28,6 +28,7 @@ sandbox() {
   export PATH="$SB/bin:$PATH" GH_LOG="$SB/gh.log"
   install_gh_mock
   install_claude_mock
+  install_oidc_mocks
 
   git init -q --bare "$SB/remote.git"
   REPO="$SB/repo"
@@ -71,6 +72,18 @@ install_claude_mock() {
 set -euo pipefail
 cat > "$PWD/../claude-stdin"
 printf '%s\n' "$@" > "$PWD/../claude-args"
+{
+  echo "rule=${ANTHROPIC_FEDERATION_RULE_ID-}"
+  echo "org=${ANTHROPIC_ORGANIZATION_ID-}"
+  echo "api_key=${ANTHROPIC_API_KEY-}"
+  echo "oidc_request=${ACTIONS_ID_TOKEN_REQUEST_TOKEN-}"
+  echo "token_file=${ANTHROPIC_IDENTITY_TOKEN_FILE-}"
+  if [[ -n ${ANTHROPIC_IDENTITY_TOKEN_FILE-} ]]; then
+    echo "jwt1=$(cat "$ANTHROPIC_IDENTITY_TOKEN_FILE")"
+    sleep "${FAKE_CLAUDE_SLEEP:-0}"
+    echo "jwt2=$(cat "$ANTHROPIC_IDENTITY_TOKEN_FILE")"
+  fi
+} > "$PWD/../claude-env"
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
 result() { printf '{"type":"result","subtype":"%s","is_error":%s,"result":"## Summary\\nreport","num_turns":2,"total_cost_usd":0.01,"duration_ms":1500}\n' "$1" "$2"; }
 case "${FAKE_CLAUDE:-edit}" in
@@ -85,6 +98,20 @@ esac
 result success false
 EOF
   chmod +x "$SB/bin/fake-claude"
+}
+
+# curl stands in for GitHub's OIDC token endpoint; env-probe lets a hook report what it can see
+install_oidc_mocks() {
+  cat > "$SB/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SB_CURL_LOG"
+[[ ${GH_MOCK_FAIL-} == oidc ]] && exit 22
+n=$(( $(cat "$SB_CURL_LOG" | grep -c '') ))
+printf '{"count":%d,"value":"jwt-%d"}' "$n" "$n"
+EOF
+  printf '#!/usr/bin/env bash\necho "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-none}" > "$SB_HOOK_ENV"\n' > "$SB/bin/env-probe"
+  chmod +x "$SB/bin/curl" "$SB/bin/env-probe"
+  export SB_CURL_LOG="$SB/curl.log" SB_HOOK_ENV="$SB/hook-env"
 }
 
 snap() { git -C "$REPO" ls-remote origin "refs/heads/agent-snapshots/*"; }
@@ -534,6 +561,69 @@ test_init() {
   eq "$(cat .claude-task/validate.sh)" custom "init overwrote a file"
   cp "$runner/templates/validate.sh" "$SB/v.sh"
   fails "$SB/v.sh" 2>/dev/null
+}
+
+# --- workload identity federation ----------------------------------------------------------------
+
+wif_repo() {
+  sandbox
+  printf 'ANTHROPIC_FEDERATION_RULE_ID=fdrl_test\nANTHROPIC_ORGANIZATION_ID=00000000-0000-0000-0000-000000000000\n' >> .claude-task/config
+  git commit -qam wif && git push -q origin main
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+}
+
+test_ci_wif() {
+  wif_repo
+  export ACTIONS_ID_TOKEN_REQUEST_URL="https://token.example/req?api-version=2" ACTIONS_ID_TOKEN_REQUEST_TOKEN=req-token
+  export CT_OIDC_REFRESH_SECONDS=1 FAKE_CLAUDE_SLEEP=2.5
+  SETUP_EXTRA=env-probe pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  grep -q "authenticating with workload identity federation" "$SB/log" || die "$(cat "$SB/log")"
+  grep -qx rule=fdrl_test "$SB/claude-env" || die "$(cat "$SB/claude-env")"
+  grep -qx org=00000000-0000-0000-0000-000000000000 "$SB/claude-env" || die "org not passed"
+  grep -qx api_key= "$SB/claude-env" || die "API key secret leaked into a WIF run"
+  grep -qx oidc_request= "$SB/claude-env" || die "Claude can see the OIDC request token"
+  eq "$(cat "$SB/hook-env")" none "setup hook can see the OIDC request token"
+  grep -qx jwt1=jwt-1 "$SB/claude-env" || die "$(cat "$SB/claude-env")"
+  grep -qx jwt2=jwt-1 "$SB/claude-env" && die "token file was not refreshed"
+  grep -q 'Authorization: Bearer req-token https://token.example/req?api-version=2&audience=https://api.anthropic.com' "$SB/curl.log" \
+    || die "$(cat "$SB/curl.log")"
+  grep -q jwt- "$SB/log" && die "token printed in the log"
+  local token_file calls
+  token_file="$(sed -n 's/^token_file=//p' "$SB/claude-env")"
+  [[ ! -e $token_file ]] || die "token file left behind"
+  calls="$(grep -c '' "$SB/curl.log")"
+  sleep 2
+  eq "$(grep -c '' "$SB/curl.log")" "$calls" "refresher still running"
+  [[ -n $(git ls-remote origin refs/heads/task-t) ]] || die "not published"
+}
+
+test_ci_wif_misconfigured() {
+  wif_repo
+  local out
+  unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+  out="$("$CI" claude 2>&1)" && die "ran without id-token permission"
+  contains "$out" "needs 'id-token: write'"
+  export ACTIONS_ID_TOKEN_REQUEST_URL="https://token.example/req?x=1" ACTIONS_ID_TOKEN_REQUEST_TOKEN=req-token
+  out="$(GH_MOCK_FAIL=oidc "$CI" claude 2>&1)" && die "ran without an OIDC token"
+  contains "$out" "couldn't get a GitHub OIDC token"
+  sed -i '/ANTHROPIC_ORGANIZATION_ID/d' "$CT_CONF"
+  out="$("$CI" claude 2>&1)" && die "ran without an organization"
+  contains "$out" "needs ANTHROPIC_ORGANIZATION_ID"
+  echo 'ANTHROPIC_ORGANIZATION_ID=$(id)' >> "$CT_CONF"
+  out="$("$CI" claude 2>&1)" && die "accepted a bad id"
+  contains "$out" "unexpected characters"
+}
+
+test_ci_requires_some_credential() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  local out
+  out="$(env -u ANTHROPIC_API_KEY "$CI" claude 2>&1)" && die "ran without credentials"
+  contains "$out" "or configure workload identity federation"
 }
 
 # --- runner ------------------------------------------------------------------------------------
