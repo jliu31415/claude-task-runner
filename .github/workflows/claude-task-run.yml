@@ -2,7 +2,7 @@
 # templates/workflow.yml, written by `submit-task init`); project specifics come from the caller's
 # .claude-task/ folder. Claude and the project's scripts run in a job with a read-only token;
 # only the publish job can write, and it runs no project code.
-name: Claude task runner
+name: claude-task-runner
 
 on:
   workflow_call:
