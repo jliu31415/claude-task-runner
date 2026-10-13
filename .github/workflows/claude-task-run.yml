@@ -30,6 +30,9 @@ on:
       SETUP_GH_TOKEN:
         description: Exposed as GH_TOKEN to the project's setup script only
         required: false
+      SETUP_GH_APP_KEY:
+        description: Private key of the GitHub App named by SETUP_GH_APP_CLIENT_ID in .claude-task/config
+        required: false
 
 env:
   # runner scripts come from this workflow's own commit (whatever the caller pinned) and the project
@@ -84,9 +87,23 @@ jobs:
       - name: Verify snapshot
         run: '"$CT_CI" verify'
 
+      - name: Read setup app
+        id: setup-app
+        run: '"$CT_CI" setup-app'
+
+      # revoked when the job ends; reaches only the setup hook
+      - name: Mint setup app token
+        id: setup-app-token
+        if: steps.setup-app.outputs.client_id != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.setup-app.outputs.client_id }}
+          private-key: ${{ secrets.SETUP_GH_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Project setup
         env:
-          GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}
+          GH_TOKEN: ${{ steps.setup-app-token.outputs.token || secrets.SETUP_GH_TOKEN }}
         run: '"$CT_CI" hook setup'
 
       - name: Run Claude

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CI side of the Claude task runner; each phase is one workflow step (see claude-task-run.yml).
-#   inputs | verify | hook <setup|validate> | claude | collect | publish
+#   inputs | verify | setup-app | hook <setup|validate> | claude | collect | publish
 # Environment:
 #   CT_CONF   trusted .claude-task/config from the dispatched commit, not the snapshot (may be absent)
 #   CT_WORK   checkout of the submitted snapshot
@@ -104,6 +104,15 @@ phase_verify() {
   [[ -z $(git -C "$CT_WORK" status --porcelain --untracked-files=all) ]] \
     || ct_die "snapshot checkout is not clean"
   echo "snapshot $CT_SNAPSHOT_SHA verified; prompt $CT_PROMPT_PATH ($(wc -c < "$CT_OUT/prompt.md") bytes)"
+}
+
+# the client ID is an identifier, not a secret; the workflow mints the token from it and the key
+phase_setup_app() {
+  local id
+  id="$(conf SETUP_GH_APP_CLIENT_ID)"
+  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "SETUP_GH_APP_CLIENT_ID in $CT_CONF_PATH has unexpected characters"
+  echo "client_id=$id" >> "$GITHUB_OUTPUT"
+  [[ -z $id ]] || echo "setup gets a GitHub App token (client $id)"
 }
 
 phase_hook() {
@@ -340,9 +349,10 @@ phase_publish() {
 case "${1-}" in
   inputs) phase_inputs ;;
   verify) phase_verify ;;
+  setup-app) phase_setup_app ;;
   hook) phase_hook "${2-}" ;;
   claude) phase_claude ;;
   collect) phase_collect ;;
   publish) phase_publish ;;
-  *) ct_die "usage: ci.sh inputs|verify|hook <setup|validate>|claude|collect|publish" ;;
+  *) ct_die "usage: ci.sh inputs|verify|setup-app|hook <setup|validate>|claude|collect|publish" ;;
 esac

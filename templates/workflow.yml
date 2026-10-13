@@ -46,5 +46,7 @@ jobs:
       # not needed with workload identity federation (.claude-task/config)
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      # optional: handed to the setup script as GH_TOKEN, e.g. to read private release assets
+      # optional: GH_TOKEN for the setup script, e.g. to read private release assets; either a
+      # token, or a GitHub App key with SETUP_GH_APP_CLIENT_ID in .claude-task/config
       SETUP_GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}
+      SETUP_GH_APP_KEY: ${{ secrets.SETUP_GH_APP_KEY }}

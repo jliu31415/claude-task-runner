@@ -626,6 +626,23 @@ test_ci_requires_some_credential() {
   contains "$out" "or configure workload identity federation"
 }
 
+test_ci_setup_app() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  "$CI" setup-app > /dev/null
+  grep -qx client_id= "$GITHUB_OUTPUT" || die "client ID set without config"
+  : > "$GITHUB_OUTPUT"
+  echo 'SETUP_GH_APP_CLIENT_ID=Iv23liAbC123' >> "$CT_CONF"
+  "$CI" setup-app > /dev/null
+  grep -qx client_id=Iv23liAbC123 "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
+  local out
+  echo 'SETUP_GH_APP_CLIENT_ID=x$(id)' >> "$CT_CONF"
+  out="$("$CI" setup-app 2>&1)" && die "accepted a bad client ID"
+  contains "$out" "unexpected characters"
+}
+
 # --- runner ------------------------------------------------------------------------------------
 
 if [[ ${1-} == --one ]]; then
