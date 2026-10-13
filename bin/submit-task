@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# Snapshot the current repo's working tree without touching the real index or checkout, push it
+# to a new temporary ref and dispatch the repo's Claude task workflow. Install by putting this
+# file (or a symlink to it) on PATH.
+set -euo pipefail
+
+CT_LIB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)"
+source "$CT_LIB/common.sh"
+
+REMOTE=origin
+PROG=submit-task
+
+usage() {
+  cat >&2 <<EOF
+usage: $PROG [-y] <name | prompt.md> [task-name]   snapshot the working tree and run the task in CI
+       $PROG status <task-id>                     show the task's workflow run and PR
+       $PROG logs <task-id>                       print the task's workflow run log
+       $PROG init                                 add the runner's files to this repo
+
+  <name> is shorthand for $CT_TASKS_DIR/<name>.md
+
+  -y, --yes   don't ask for confirmation before pushing the snapshot
+EOF
+  exit 2
+}
+
+repo_slug() {
+  local url
+  url="$(git -C "${1:-.}" config --get "remote.$REMOTE.url")" || ct_die "no '$REMOTE' remote in ${1:-.}"
+  if [[ $url =~ ^(https://|ssh://git@|git@)github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
+    echo "${BASH_REMATCH[2]%.git}"
+  else
+    ct_die "remote '$REMOTE' is not a GitHub repository: $url"
+  fi
+}
+
+require_gh() {
+  command -v gh >/dev/null 2>&1 || ct_die "gh CLI not found; install it, then 'gh auth login'"
+  gh auth status >/dev/null 2>&1 || ct_die "gh is not authenticated; run 'gh auth login'"
+}
+
+find_run() {
+  local slug=$1 workflow=$2 task_id=$3
+  gh run list -R "$slug" -w "$workflow" -e workflow_dispatch -L 50 \
+    --json databaseId,url,displayTitle \
+    --jq ".[] | select(.displayTitle == \"Claude task $task_id\") | \"\(.databaseId) \(.url)\"" | head -n1
+}
+
+cmd_status_or_logs() {
+  local cmd=$1 task_id=$2 root slug workflow=$CT_WORKFLOW prefix run
+  ct_valid_task_id "$task_id" || ct_die "invalid task id: $task_id"
+  require_gh
+  root="$(git rev-parse --show-toplevel)"
+  prefix="$(ct_conf_get "$root/$CT_CONF_PATH" RESULT_BRANCH_PREFIX)"
+  slug="$(repo_slug)"
+  run="$(find_run "$slug" "$workflow" "$task_id")"
+  [[ -n $run ]] || ct_die "no '$workflow' run found for task $task_id"
+  if [[ $cmd == logs ]]; then
+    gh run view "${run%% *}" -R "$slug" --log
+    return
+  fi
+  gh run view "${run%% *}" -R "$slug"
+  echo "result branch: $prefix$(ct_task_name_of "$task_id")"
+  gh pr list -R "$slug" --head "$prefix$(ct_task_name_of "$task_id")" --state all \
+    --json url,state --jq '.[] | "PR: \(.url) (\(.state))"'
+}
+
+# resolves the prompt argument (relative to the caller's cwd) to a safe repo-relative path
+resolve_prompt() {
+  local arg=$1 root=$2 abs rel
+  if [[ ! -e $arg && $arg != */* && $arg != *.md ]]; then
+    arg="$root/$CT_TASKS_DIR/$arg.md"
+  fi
+  [[ -e $arg ]] || ct_die "prompt not found: $arg"
+  [[ -L $arg ]] && ct_die "prompt must not be a symlink: $arg"
+  [[ -f $arg ]] || ct_die "prompt is not a regular file: $arg"
+  abs="$(realpath -e -- "$arg")"
+  [[ $abs == "$root"/* ]] || ct_die "prompt is outside the repository: $arg"
+  rel="${abs#"$root"/}"
+  ct_valid_prompt_path "$rel" || ct_die "prompt path must be a .md file with a plain repo-relative path ([A-Za-z0-9._-] segments): $rel"
+  echo "$rel"
+}
+
+# builds the snapshot tree in a throwaway index; prints the tree sha
+build_tree() {
+  local index=$1 base=$2 force=${3-}
+  rm -f "$index"
+  GIT_INDEX_FILE="$index" git read-tree "$base"
+  GIT_INDEX_FILE="$index" git add --all -- .
+  [[ -z $force ]] || GIT_INDEX_FILE="$index" git add --force -- "$force"
+  GIT_INDEX_FILE="$index" git write-tree
+}
+
+check_tree_supported() {
+  local tree=$1 gitlinks
+  gitlinks="$(git ls-tree -r "$tree" | awk '$1 == "160000" { sub(/^[^\t]*\t/, ""); print }')"
+  if [[ -n $gitlinks ]]; then
+    printf '%s\n' "$gitlinks" | sed 's/^/  /' >&2
+    ct_die "the snapshot contains submodules or nested git repositories (above), which the task runner doesn't support; remove them or add them to .gitignore"
+  fi
+  if git ls-tree -r --name-only "$tree" | git check-attr --stdin filter | grep -q ': filter: lfs$'; then
+    ct_die "the snapshot contains Git LFS files, which the task runner doesn't support yet"
+  fi
+}
+
+write_new() {
+  local src=$1 dest=$2
+  if [[ -e $dest ]]; then
+    echo "  kept     $dest (already exists)"
+    return
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp -p "$src" "$dest"
+  echo "  created  $dest"
+}
+
+cmd_init() {
+  local root runner runner_sha runner_version runner_slug tmp_wf
+  root="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
+  cd "$root"
+  runner="$(cd "$CT_LIB/.." && pwd)"
+  runner_sha="$(git -C "$runner" rev-parse HEAD)" || ct_die "the runner at $runner is not a git checkout"
+  runner_version="$(git -C "$runner" describe --tags --exact-match 2>/dev/null || echo untagged)"
+  runner_slug="$(repo_slug "$runner")"
+  [[ -z $(git -C "$runner" status --porcelain) ]] \
+    || ct_warn "the runner checkout at $runner has local changes; the workflow pins its HEAD commit, which doesn't include them"
+  [[ -n $(git -C "$runner" branch -r --contains "$runner_sha" 2>/dev/null) ]] \
+    || ct_warn "runner commit $runner_sha isn't on $runner_slug yet; push it before using the workflow"
+
+  tmp_wf="$(mktemp)"
+  sed -e "s|@RUNNER_SLUG@|$runner_slug|g" -e "s|@RUNNER_SHA@|$runner_sha|g" \
+      -e "s|@RUNNER_VERSION@|$runner_version|g" "$runner/templates/workflow.yml" > "$tmp_wf"
+
+  echo "initializing $root (runner $runner_slug@$runner_version)"
+  write_new "$runner/templates/validate.sh" "$CT_VALIDATE_PATH"
+  write_new "$runner/templates/setup.sh" "$CT_SETUP_PATH"
+  write_new "$runner/templates/gitignore" "$CT_DIR/.gitignore"
+  write_new "$tmp_wf" ".github/workflows/$CT_WORKFLOW"
+  rm -f "$tmp_wf"
+  mkdir -p "$CT_TASKS_DIR"
+  cat <<EOF
+next:
+  1. put the project's checks in $CT_VALIDATE_PATH and its dependency install in $CT_SETUP_PATH
+  2. commit and push to the base branch
+  3. add the ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) secret, and enable
+     Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"
+  4. write $CT_TASKS_DIR/<name>.md and run: $PROG <name>
+EOF
+}
+
+cmd_submit() {
+  local assume_yes=$1 prompt_arg=$2 name_arg=${3-}
+  local root conf base_branch prefix workflow=$CT_WORKFLOW branch base_sha task_name task_id rel
+  local force=""
+  local tree tree2 attempt snapshot_sha snapshot_ref result_branch slug changes nchanges
+
+  root="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
+  root="$(realpath -e "$root")"
+  rel="$(resolve_prompt "$prompt_arg" "$root")"
+  cd "$root"
+
+  conf="$root/$CT_CONF_PATH"
+  base_branch="$(ct_conf_get "$conf" BASE_BRANCH)"
+  prefix="$(ct_conf_get "$conf" RESULT_BRANCH_PREFIX)"
+  [[ -f $CT_VALIDATE_PATH && -f .github/workflows/$workflow ]] \
+    || ct_die "this repo isn't set up for the task runner; run '$PROG init', fill in $CT_VALIDATE_PATH and push"
+
+  branch="$(git symbolic-ref --quiet --short HEAD)" || ct_die "HEAD is detached; check out $base_branch first"
+  [[ $branch == "$base_branch" ]] || ct_die "current branch is '$branch'; submit tasks from '$base_branch'"
+
+  if [[ -n $name_arg ]]; then
+    ct_valid_task_name "$name_arg" || ct_die "invalid task name '$name_arg': use 1-40 of [a-z0-9-], starting and ending with a letter or digit"
+    task_name=$name_arg
+  else
+    local stem="${rel##*/}"
+    task_name="$(ct_sanitize_task_name "${stem%.md}")"
+    ct_valid_task_name "$task_name" || ct_die "can't derive a task name from '$rel'; pass one explicitly"
+  fi
+  task_id="$(ct_new_task_id "$task_name")"
+  snapshot_ref="$CT_SNAPSHOT_PREFIX$task_id"
+  result_branch="$prefix$task_name"
+  ct_valid_branch "$result_branch" || ct_die "invalid result branch name: $result_branch"
+
+  # ignored prompts are uploaded only from the tasks folder, which exists for exactly that
+  if git check-ignore -q -- "$rel"; then
+    [[ $rel == "$CT_TASKS_DIR"/* ]] \
+      || ct_die "prompt $rel is ignored by git; put it in $CT_TASKS_DIR/ or un-ignore it"
+    force=$rel
+  fi
+
+  slug="$(repo_slug)"
+  require_gh
+
+  # global so the EXIT trap still sees it after this function returns
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+
+  # build twice and compare, so a file changing mid-snapshot is caught instead of half-captured
+  for attempt in 1 2 3; do
+    base_sha="$(git rev-parse --verify HEAD^{commit})"
+    tree="$(build_tree "$tmp/index" "$base_sha" "$force")"
+    tree2="$(build_tree "$tmp/index" "$base_sha" "$force")"
+    [[ $tree == "$tree2" && $(git rev-parse HEAD) == "$base_sha" ]] && break
+    [[ $attempt -eq 3 ]] && ct_die "the working tree kept changing while the snapshot was built; retry once it's idle"
+    sleep 1
+  done
+  rm -f "$tmp/index"
+
+  [[ $(git rev-parse "$tree:$rel" 2>/dev/null) == "$(git hash-object -- "$rel")" ]] \
+    || ct_die "prompt $rel is missing from the snapshot or differs from the file on disk"
+  check_tree_supported "$tree"
+
+  local hits
+  if ! hits="$(ct_secret_scan "$base_sha" "$tree")"; then
+    printf '  %s\n' "$hits" >&2
+    ct_die "possible secrets in the snapshot (above); remove or gitignore them before submitting"
+  fi
+
+  changes="$(git diff --name-status --no-renames "$base_sha" "$tree")"
+  nchanges="$(printf '%s' "$changes" | grep -c '' || true)"
+  echo "task:     $task_id"
+  echo "base:     $base_sha ($base_branch)"
+  echo "prompt:   $rel"
+  if [[ $nchanges -eq 0 ]]; then
+    echo "changes:  none (snapshot tree equals HEAD)"
+  else
+    echo "changes:  $nchanges file(s) relative to HEAD ($(git diff --shortstat "$base_sha" "$tree" | sed 's/^ //'))"
+    printf '%s\n' "$changes" | head -n 40 | sed 's/^/  /'
+    [[ $nchanges -le 40 ]] || echo "  ... and $((nchanges - 40)) more"
+  fi
+  if git rev-parse --verify --quiet "refs/remotes/$REMOTE/$base_branch" >/dev/null \
+     && ! git merge-base --is-ancestor "$base_sha" "refs/remotes/$REMOTE/$base_branch"; then
+    ct_warn "HEAD has commits not on $REMOTE/$base_branch (as of your last fetch); they'll be pushed with the snapshot and show up in the PR"
+  fi
+
+  if git ls-remote --exit-code "$REMOTE" "refs/heads/$result_branch" >/dev/null 2>&1; then
+    ct_die "result branch '$result_branch' already exists on $REMOTE; pick another task name"
+  fi
+
+  if [[ $assume_yes -eq 0 ]]; then
+    [[ -t 0 ]] || ct_die "not a terminal; pass --yes to submit without confirmation"
+    local reply
+    read -r -p "push snapshot to $REMOTE/$snapshot_ref and start the task? [y/N] " reply
+    [[ $reply == [yY]* ]] || { echo "aborted; nothing was pushed"; exit 1; }
+  fi
+
+  snapshot_sha="$(printf 'Snapshot for task %s\n\nprompt: %s\n' "$task_id" "$rel" |
+    git -c user.name='Task Snapshot' -c user.email='task-snapshot@users.noreply.github.com' \
+      commit-tree "$tree" -p "$base_sha")"
+
+  if ! ct_push_new_ref "$REMOTE" "$snapshot_sha" "refs/heads/$snapshot_ref"; then
+    ct_die "pushing the snapshot to $REMOTE/$snapshot_ref failed (nothing was dispatched)"
+  fi
+  echo "snapshot: $snapshot_sha -> $REMOTE/$snapshot_ref"
+
+  local -a inputs=(
+    -f "snapshot_ref=$snapshot_ref" -f "snapshot_sha=$snapshot_sha" -f "prompt_path=$rel"
+    -f "task_name=$task_name" -f "task_id=$task_id"
+  )
+  if ! gh workflow run "$workflow" -R "$slug" --ref "$base_branch" "${inputs[@]}"; then
+    cat >&2 <<EOF
+claude-task: dispatching $workflow failed; the snapshot is kept at $REMOTE/$snapshot_ref.
+  retry:   gh workflow run $workflow -R $slug --ref $base_branch $(printf '%q ' "${inputs[@]}")
+  discard: git push $REMOTE --delete $snapshot_ref
+EOF
+    exit 1
+  fi
+
+  local run=""
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    run="$(find_run "$slug" "$workflow" "$task_id" 2>/dev/null || true)"
+    [[ -n $run ]] && break
+    sleep 2
+  done
+  echo "dispatched $workflow on $base_branch"
+  if [[ -n $run ]]; then
+    echo "run:      ${run#* }"
+  else
+    echo "run:      not listed yet; see https://github.com/$slug/actions/workflows/$workflow"
+  fi
+  echo "status:   $PROG status $task_id"
+}
+
+assume_yes=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    -y|--yes) assume_yes=1 ;;
+    -h|--help) usage ;;
+    -*) usage ;;
+    *) args+=("$a") ;;
+  esac
+done
+[[ ${#args[@]} -ge 1 ]] || usage
+
+case "${args[0]}" in
+  init)
+    [[ ${#args[@]} -eq 1 ]] || usage
+    cmd_init
+    ;;
+  status|logs)
+    [[ ${#args[@]} -eq 2 ]] || usage
+    cmd_status_or_logs "${args[0]}" "${args[1]}"
+    ;;
+  *)
+    [[ ${#args[@]} -le 2 ]] || usage
+    cmd_submit "$assume_yes" "${args[0]}" "${args[1]-}"
+    ;;
+esac

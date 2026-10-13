@@ -1,0 +1,164 @@
+# Reusable Claude task workflow. A project calls it from a thin workflow_dispatch wrapper (see
+# templates/workflow.yml, written by `submit-task init`); project specifics come from the caller's
+# .claude-task/ folder. Claude and the project's scripts run in a job with a read-only token;
+# only the publish job can write, and it runs no project code.
+name: Claude task runner
+
+on:
+  workflow_call:
+    inputs:
+      snapshot_ref:
+        type: string
+        required: true
+      snapshot_sha:
+        type: string
+        required: true
+      prompt_path:
+        type: string
+        required: true
+      task_name:
+        type: string
+        required: true
+      task_id:
+        type: string
+        required: true
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      SETUP_TOKEN:
+        description: Exposed as GH_TOKEN to the project's setup script only
+        required: false
+
+env:
+  # runner scripts come from this workflow's own commit (whatever the caller pinned) and the project
+  # config from the caller's dispatched commit; neither is ever read from the snapshot
+  CT_CI: ${{ github.workspace }}/runner/lib/ci.sh
+  CT_CONF: ${{ github.workspace }}/project/.claude-task/config
+  CT_WORK: ${{ github.workspace }}/work
+  CT_OUT: ${{ github.workspace }}/out
+  CT_SNAPSHOT_REF: ${{ inputs.snapshot_ref }}
+  CT_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
+  CT_PROMPT_PATH: ${{ inputs.prompt_path }}
+  CT_TASK_NAME: ${{ inputs.task_name }}
+  CT_TASK_ID: ${{ inputs.task_id }}
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      has_changes: ${{ steps.collect.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: runner
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: project
+          sparse-checkout: .claude-task/config
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check inputs
+        run: '"$CT_CI" inputs'
+
+      # depth 2: the parent tells an uploaded prompt apart from one already in the repo
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.snapshot_ref }}
+          path: work
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify snapshot
+        run: '"$CT_CI" verify'
+
+      - name: Project setup
+        env:
+          GH_TOKEN: ${{ secrets.SETUP_TOKEN }}
+        run: '"$CT_CI" hook setup'
+
+      - name: Run Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: '"$CT_CI" claude'
+
+      - name: Collect changes
+        id: collect
+        run: '"$CT_CI" collect'
+
+      - name: Project validation
+        run: '"$CT_CI" hook validate'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: claude-task-${{ inputs.task_id }}
+          path: |
+            out/changes.patch
+            out/tree
+            out/files.txt
+            out/claude-report.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: claude-task-${{ inputs.task_id }}-transcript
+          path: out/transcript.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: runner
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: project
+          sparse-checkout: .claude-task/config
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check inputs
+        run: '"$CT_CI" inputs'
+
+      # depth 2 for the PR body's list of submitted local changes and the uploaded-prompt check
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.snapshot_ref }}
+          path: work
+          fetch-depth: 2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: claude-task-${{ inputs.task_id }}
+          path: out
+
+      - name: Publish branch and PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$CT_CI" publish'
