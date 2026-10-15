@@ -33,6 +33,9 @@ on:
       SETUP_GH_APP_KEY:
         description: Private key of the GitHub App named by SETUP_GH_APP_CLIENT_ID in .claude-task/config
         required: false
+      SETUP_ENV:
+        description: Exposed as SETUP_ENV to the project's setup script only, e.g. KEY=value lines
+        required: false
 
 env:
   # runner scripts come from this workflow's own commit (whatever the caller pinned) and the project
@@ -104,6 +107,7 @@ jobs:
       - name: Project setup
         env:
           GH_TOKEN: ${{ steps.setup-app-token.outputs.token || secrets.SETUP_GH_TOKEN }}
+          SETUP_ENV: ${{ secrets.SETUP_ENV }}
         run: '"$CT_CI" hook setup'
 
       - name: Run Claude

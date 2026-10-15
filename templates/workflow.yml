@@ -50,3 +50,6 @@ jobs:
       # token, or a GitHub App key with SETUP_GH_APP_CLIENT_ID in .claude-task/config
       SETUP_GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}
       SETUP_GH_APP_KEY: ${{ secrets.SETUP_GH_APP_KEY }}
+      # optional: SETUP_ENV for the setup script, e.g. KEY=value lines it writes to a gitignored
+      # env file the project needs at runtime
+      SETUP_ENV: ${{ secrets.SETUP_ENV }}
