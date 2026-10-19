@@ -85,7 +85,10 @@ printf '%s\n' "$@" > "$PWD/../claude-args"
   fi
 } > "$PWD/../claude-env"
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
-result() { printf '{"type":"result","subtype":"%s","is_error":%s,"result":"## Summary\\nreport","num_turns":2,"total_cost_usd":0.01,"duration_ms":1500}\n' "$1" "$2"; }
+result() {
+  jq -nc --arg subtype "$1" --argjson is_error "$2" --arg report "${FAKE_REPORT-$'Commit: change a; add src/new\n\n## Summary\nreport'}" \
+    '{type: "result", subtype: $subtype, is_error: $is_error, result: $report, num_turns: 2, total_cost_usd: 0.01, duration_ms: 1500}'
+}
 case "${FAKE_CLAUDE:-edit}" in
   edit) echo "changed by claude" >> a.txt; mkdir -p src; echo new > src/new.txt; rm c.txt ;;
   none) ;;
@@ -356,13 +359,26 @@ test_ci_success_publishes_pr() {
   eq "$(git diff --name-only HEAD "$tip" | tr '\n' ' ')" "a.txt b.txt c.txt src/new.txt " "PR diff vs main"
   eq "$(git show "$tip:b.txt")" "$(cat b.txt)" "baseline kept"
   fails git cat-file -e "$tip:build/setup.out"
-  grep -q "^pr create --repo test/repo --base main --head task-t --title Claude task: t" "$GH_LOG" || die "$(cat "$GH_LOG")"
+  grep -q "^pr create --repo test/repo --base main --head task-t --title change a; add src/new --body-file" "$GH_LOG" || die "$(cat "$GH_LOG")"
+  eq "$(git log -1 --format=%s "$tip")" "change a; add src/new" "commit subject"
+  grep -q "^Task: $TASK_ID\$" <<< "$(git log -1 --format=%b "$tip")" || die "commit body lacks task id"
   grep -q "$SNAP_SHA" "$SB/out/pr-body.md" || die "PR body lacks snapshot sha"
   grep -q "$TASK_ID" "$SB/out/pr-body.md" || die "PR body lacks task id"
   grep -q '^## Summary' "$SB/out/pr-body.md" || die "PR body lacks Claude's report"
+  grep -q '^Commit:' "$SB/out/pr-body.md" && die "PR body keeps the Commit line"
   grep -qx 'Do the thing.' "$SB/out/pr-body.md" || die "PR body lacks the prompt"
   grep -qx '````' "$SB/out/pr-body.md" || die "prompt fence not longer than its backtick runs"
   eq "$(snap)" "" "snapshot ref not cleaned up"
+}
+
+test_ci_commit_subject_fallback() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  FAKE_REPORT=$'## Summary\nno commit line' pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  grep -q "^pr create --repo test/repo --base main --head task-t --title Claude task: t --body-file" "$GH_LOG" || die "$(cat "$GH_LOG")"
+  grep -q '^## Summary' "$SB/out/pr-body.md" || die "PR body lacks Claude's report"
 }
 
 test_ci_claude_failure_blocks_publish() {

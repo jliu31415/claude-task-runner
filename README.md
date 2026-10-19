@@ -180,6 +180,9 @@ them are what runs, but Claude can't change them.
 
 The result branch is the snapshot plus one commit with Claude's changes. If the prompt wasn't
 already committed in `HEAD`, that commit also removes it again, so prompts never land in the PR.
+Claude writes the commit message, which is also the PR title (`Claude task: <task-name>` if it
+doesn't give one). With squash merges, set the repo's default squash message to the PR title so
+it carries over to the base branch.
 
 Other local changes in the snapshot that aren't on the base branch yet do show up in the PR. Git
 can't leave them out, because Claude's work is built on top of them. The last commit alone is

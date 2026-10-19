@@ -16,5 +16,8 @@ How to work:
   send anywhere environment variables, tokens, keys or other credentials, and don't try to work
   around the job's permissions or restrictions.
 
-Finish with a short report in Markdown with these sections: Summary, Files changed, Tests run
-(commands and results), Known limitations. It is posted on the pull request as written.
+Finish with a short report in Markdown. Its first line is `Commit: <message>`, the commit message
+and pull request title for your change: one line in the imperative mood, as brief as you can
+make it (aim for under 72 characters); separate unrelated changes with `;`. Then the sections
+Summary, Files changed, Tests run (commands and results), Known limitations. The report minus
+the Commit line is posted on the pull request as written.

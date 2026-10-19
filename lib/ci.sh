@@ -257,6 +257,23 @@ delete_snapshot() {
   fi
 }
 
+# Claude's report starts with a `Commit: <message>` line (lib/instructions.md); without one, fall
+# back to the task name
+commit_subject() {
+  local line
+  line="$(grep -m1 -v '^[[:space:]]*$' "$CT_OUT/claude-report.md" | tr -d '[:cntrl:]' || true)"
+  if [[ $line =~ ^[[:space:]]*Commit:[[:space:]]*(.*[^[:space:]]) ]]; then
+    printf '%s' "${BASH_REMATCH[1]:0:200}"
+  else
+    printf 'Claude task: %s' "$CT_TASK_NAME"
+  fi
+}
+
+report_body() {
+  awk '!done && /^[[:space:]]*$/ { next } !done { done = 1; if ($0 ~ /^[[:space:]]*Commit:/) next } 1' \
+    "$CT_OUT/claude-report.md"
+}
+
 pr_body() {
   local run_url=$1 parent
   cat <<EOF
@@ -304,11 +321,11 @@ EOF
   echo
   echo "### Claude's report"
   echo
-  head -c 20000 "$CT_OUT/claude-report.md"
+  report_body | head -c 20000
 }
 
 phase_publish() {
-  local base prefix branch tree hits new run_url
+  local base prefix branch tree hits new run_url subject
   check_inputs
   check_head
   cd "$CT_WORK"
@@ -336,8 +353,9 @@ phase_publish() {
     ct_die "result branch $branch already exists; not overwriting it. The patch is in this run's artifact and $CT_SNAPSHOT_REF is kept."
   fi
 
-  printf 'Claude task %s\n\nPrompt: %s\nSnapshot: %s\nRun: %s\n' \
-      "$CT_TASK_ID" "$CT_PROMPT_PATH" "$CT_SNAPSHOT_SHA" "$run_url" |
+  subject="$(commit_subject)"
+  printf '%s\n\nTask: %s\nPrompt: %s\nSnapshot: %s\nRun: %s\n' \
+      "$subject" "$CT_TASK_ID" "$CT_PROMPT_PATH" "$CT_SNAPSHOT_SHA" "$run_url" |
     git -c user.name='github-actions[bot]' \
         -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
         commit --quiet --no-verify -F -
@@ -349,7 +367,7 @@ phase_publish() {
   pr_body "$run_url" > "$CT_OUT/pr-body.md"
   local pr
   if ! pr="$(gh pr create --repo "${GITHUB_REPOSITORY:?}" --base "$base" --head "$branch" \
-      --title "Claude task: $CT_TASK_NAME" --body-file "$CT_OUT/pr-body.md")"; then
+      --title "$subject" --body-file "$CT_OUT/pr-body.md")"; then
     ct_die "pushed $branch but creating the PR failed; open it by hand (gh pr create --base $base --head $branch). $CT_SNAPSHOT_REF is kept."
   fi
   echo "opened $pr"
