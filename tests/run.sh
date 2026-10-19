@@ -495,6 +495,26 @@ test_ci_publish_rejects_tampered_patch() {
 
 # --- the .claude-task/ folder ------------------------------------------------------------------
 
+test_ci_template_wraps_prompt() {
+  sandbox
+  printf 'header\n\n  {{task}}\n\nfooter {{task}} stays\n' > .claude-task/template.md
+  printf '# Task\nDo the thing.\n{{task}}\n' > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  eq "$(cat "$SB/claude-stdin")" $'header\n\n# Task\nDo the thing.\n{{task}}\n\nfooter {{task}} stays' "wrapped prompt"
+  grep -qx 'Do the thing.' "$SB/out/pr-body.md" || die "PR body lacks the prompt"
+  grep -qx 'header' "$SB/out/pr-body.md" && die "PR body shows the template"
+
+  sandbox
+  printf 'no placeholder\n' > .claude-task/template.md
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  pipeline > "$SB/log" 2>&1 && die "template without {{task}} accepted"
+  grep -q "must have exactly one {{task}} line (found 0)" "$SB/log" || die "$(cat "$SB/log")"
+}
+
 test_tasks_folder_prompt() {
   sandbox
   mkdir -p .claude-task/tasks

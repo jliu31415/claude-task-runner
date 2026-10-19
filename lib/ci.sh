@@ -88,19 +88,38 @@ phase_inputs() {
     || ct_die "dispatch the workflow from $base (got ref ${GITHUB_REF-unset}); its config and scripts are trusted only there"
 }
 
-phase_verify() {
+snapshot_regular_file() {
   local entry mode type
+  entry="$(git -C "$CT_WORK" ls-tree HEAD -- "$1")"
+  read -r mode type _ <<< "$entry"
+  [[ $type == blob && ( $mode == 100644 || $mode == 100755 ) ]]
+}
+
+# the optional template wraps every task: its one `{{task}}` line is replaced by the prompt
+apply_template() {
+  local template="$CT_OUT/template.md" n
+  git -C "$CT_WORK" cat-file -e "HEAD:$CT_TEMPLATE_PATH" 2>/dev/null || return 0
+  snapshot_regular_file "$CT_TEMPLATE_PATH" || ct_die "$CT_TEMPLATE_PATH is not a regular file in the snapshot"
+  git -C "$CT_WORK" cat-file blob "HEAD:$CT_TEMPLATE_PATH" > "$template"
+  n="$(grep -c '^[[:space:]]*{{task}}[[:space:]]*$' "$template" || true)"
+  [[ $n -eq 1 ]] || ct_die "$CT_TEMPLATE_PATH must have exactly one {{task}} line (found $n)"
+  awk -v task="$CT_OUT/task.md" '
+    /^[[:space:]]*\{\{task\}\}[[:space:]]*$/ { while ((getline line < task) > 0) print line; next }
+    { print }' "$template" > "$CT_OUT/prompt.md"
+  echo "wrapped the prompt in $CT_TEMPLATE_PATH"
+}
+
+phase_verify() {
   check_inputs
   check_head
   git -C "$CT_WORK" rev-parse --verify --quiet "$CT_SNAPSHOT_SHA^" >/dev/null \
     || ct_die "the snapshot's parent commit wasn't fetched (checkout needs fetch-depth 2)"
   no_gitlinks HEAD
-  entry="$(git -C "$CT_WORK" ls-tree HEAD -- "$CT_PROMPT_PATH")"
-  read -r mode type _ <<< "$entry"
-  [[ $type == blob && ( $mode == 100644 || $mode == 100755 ) ]] \
-    || ct_die "prompt $CT_PROMPT_PATH is not a regular file in the snapshot"
-  git -C "$CT_WORK" cat-file blob "HEAD:$CT_PROMPT_PATH" > "$CT_OUT/prompt.md"
-  [[ -s $CT_OUT/prompt.md ]] || ct_die "prompt $CT_PROMPT_PATH is empty"
+  snapshot_regular_file "$CT_PROMPT_PATH" || ct_die "prompt $CT_PROMPT_PATH is not a regular file in the snapshot"
+  git -C "$CT_WORK" cat-file blob "HEAD:$CT_PROMPT_PATH" > "$CT_OUT/task.md"
+  [[ -s $CT_OUT/task.md ]] || ct_die "prompt $CT_PROMPT_PATH is empty"
+  cp "$CT_OUT/task.md" "$CT_OUT/prompt.md"
+  apply_template
   [[ -z $(git -C "$CT_WORK" status --porcelain --untracked-files=all) ]] \
     || ct_die "snapshot checkout is not clean"
   echo "snapshot $CT_SNAPSHOT_SHA verified; prompt $CT_PROMPT_PATH ($(wc -c < "$CT_OUT/prompt.md") bytes)"
