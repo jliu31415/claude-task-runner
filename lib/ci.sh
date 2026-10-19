@@ -284,6 +284,17 @@ EOF
     echo "</details>"
     echo
   fi
+  local prompt fence='```'
+  prompt="$(git show "$CT_SNAPSHOT_SHA:$CT_PROMPT_PATH" | head -c 20000)"
+  # a fence longer than any backtick run in the prompt, so the prompt can't close it early
+  while [[ $prompt == *"$fence"* ]]; do fence+='`'; done
+  echo "<details><summary>Prompt</summary>"
+  echo
+  echo "$fence"
+  printf '%s\n' "$prompt"
+  echo "$fence"
+  echo "</details>"
+  echo
   echo "<details><summary>Claude's changes</summary>"
   echo
   echo '```'

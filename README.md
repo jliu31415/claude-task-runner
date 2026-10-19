@@ -184,8 +184,8 @@ already committed in `HEAD`, that commit also removes it again, so prompts never
 Other local changes in the snapshot that aren't on the base branch yet do show up in the PR. Git
 can't leave them out, because Claude's work is built on top of them. The last commit alone is
 Claude's work. The PR body lists both parts separately, along with the task ID, snapshot SHA, run
-link and Claude's report. For a PR with only Claude's edits, push your local changes to the base
-branch before submitting.
+link, the prompt and Claude's report. For a PR with only Claude's edits, push your local changes
+to the base branch before submitting.
 
 ## Recovery
 

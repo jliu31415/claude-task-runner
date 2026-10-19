@@ -338,7 +338,7 @@ test_submodules_and_lfs_rejected() {
 test_ci_success_publishes_pr() {
   sandbox
   echo "local change" >> b.txt
-  printf '# Task\nDo the thing.\n' > tasks/t.md
+  printf '# Task\nDo the thing.\n```\nexample\n```\n' > tasks/t.md
   submit tasks/t.md
   ci_env
   pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
@@ -360,6 +360,8 @@ test_ci_success_publishes_pr() {
   grep -q "$SNAP_SHA" "$SB/out/pr-body.md" || die "PR body lacks snapshot sha"
   grep -q "$TASK_ID" "$SB/out/pr-body.md" || die "PR body lacks task id"
   grep -q '^## Summary' "$SB/out/pr-body.md" || die "PR body lacks Claude's report"
+  grep -qx 'Do the thing.' "$SB/out/pr-body.md" || die "PR body lacks the prompt"
+  grep -qx '````' "$SB/out/pr-body.md" || die "prompt fence not longer than its backtick runs"
   eq "$(snap)" "" "snapshot ref not cleaned up"
 }
 
