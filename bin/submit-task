@@ -20,7 +20,7 @@ usage: $PROG [-y] <name | prompt.md> [task-name]   snapshot the working tree and
 
   <name> is shorthand for $CT_TASKS_DIR/<name>.md. Submitting from the base branch starts a new
   task and PR; submitting from a task's result branch adds a commit to its open PR. Without a
-  task id, status, logs and continue list the recent tasks to pick from.
+  task id, status and logs list the recent tasks to pick from, and continue those with an open PR.
 
   -y, --yes        don't ask for confirmation before pushing the snapshot
   -w, --worktree   continue in a new worktree next to this checkout instead of switching branches
@@ -50,22 +50,38 @@ find_run() {
     --jq ".[] | select(.displayTitle == \"Claude task $task_id\") | \"\(.databaseId) \(.url)\"" | head -n1
 }
 
-# lists the repo's recent tasks on the terminal and prints the id of the one picked
+# lists the repo's recent tasks on the terminal and prints the id of the one picked; with open_only,
+# only the newest task of each result branch that has an open PR
 pick_task() {
-  local slug=$1 runs reply i id state created
-  local -a ids=()
+  local slug=$1 open_only=${2-0} runs open="" seen=" " prefix branch reply id state created i w=0
+  local -a ids=() rows=()
   [[ -t 0 ]] || ct_die "not a terminal; pass a task id"
-  runs="$(gh run list -R "$slug" -w "$CT_WORKFLOW" -e workflow_dispatch -L 20 \
+  runs="$(gh run list -R "$slug" -w "$CT_WORKFLOW" -e workflow_dispatch -L 50 \
     --json displayTitle,status,conclusion,createdAt \
     --jq '.[] | select(.displayTitle | startswith("Claude task ")) | [(.displayTitle | ltrimstr("Claude task ")),
-            (if .status == "completed" then .conclusion else .status end), (.createdAt[0:16] | sub("T"; " "))] | @tsv')" \
+            (if .status == "completed" then .conclusion else .status end), (.createdAt | fromdate | strflocaltime("%b %d %H:%M"))] | @tsv')" \
     || ct_die "listing the '$CT_WORKFLOW' runs failed"
+  if [[ $open_only -eq 1 ]]; then
+    prefix="$(ct_conf_get "$(git rev-parse --show-toplevel)/$CT_CONF_PATH" RESULT_BRANCH_PREFIX)"
+    open="$(gh pr list -R "$slug" --state open -L 200 --json headRefName,isCrossRepository \
+      --jq 'map(select(.isCrossRepository | not)) | .[].headRefName')" || ct_die "listing the open PRs failed"
+    open=" ${open//$'\n'/ } "
+  fi
   while IFS=$'\t' read -r id state created; do
     ct_valid_task_id "$id" || continue
+    if [[ $open_only -eq 1 ]]; then
+      branch="$prefix$(ct_task_name_of "$id")"
+      [[ $open == *" $branch "* && $seen != *" $branch "* ]] || continue
+      seen+="$branch "
+    fi
     ids+=("$id")
-    printf '%3d) %-48s %-12s %s UTC\n' "${#ids[@]}" "$id" "$state" "$created" >&2
+    rows+=("$created  $state")
+    (( ${#id} > w )) && w=${#id}
   done <<< "$runs"
-  [[ ${#ids[@]} -gt 0 ]] || ct_die "no '$CT_WORKFLOW' runs found"
+  [[ ${#ids[@]} -gt 0 ]] || ct_die "no recent tasks${open:+ with an open PR}"
+  for i in "${!ids[@]}"; do
+    printf '%3d) %-*s  %s\n' "$((i + 1))" "$w" "${ids[i]}" "${rows[i]}" >&2
+  done
   read -r -p "task [1]: " reply
   reply=${reply:-1}
   [[ $reply =~ ^[0-9]+$ ]] && (( 10#$reply >= 1 && 10#$reply <= ${#ids[@]} )) \
@@ -430,7 +446,7 @@ case "${args[0]}" in
     if [[ -z $task_id ]]; then
       require_gh
       slug="$(repo_slug)"
-      task_id="$(pick_task "$slug")"
+      task_id="$(pick_task "$slug" "$([[ ${args[0]} == continue ]] && echo 1 || echo 0)")"
     fi
     if [[ ${args[0]} == continue ]]; then
       cmd_continue "$task_id" "$worktree"

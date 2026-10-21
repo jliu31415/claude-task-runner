@@ -67,6 +67,7 @@ case "$1 $2" in
   "pr comment") exit 0 ;;
   "pr list")
     case "$*" in
+      *headRefName*) printf '%s\n' "${GH_MOCK_OPEN_BRANCHES-}" ;;
       *number,title,state*) printf '%s\n' "${GH_MOCK_PR-OPEN	12	fix the thing}" ;;
       *isCrossRepository*|*"--json url --jq"*) echo "${GH_MOCK_PR_URL-https://github.com/test/repo/pull/12}" ;;
     esac ;;
@@ -685,7 +686,7 @@ test_pick_task() {
   contains "$out" "not a terminal; pass a task id"
 
   # script gives the CLI a terminal to prompt on
-  export GH_MOCK_RUNS=$'usb-fix-8b20e4\tsuccess\t2026-10-20 14:03\nbad id\tfailure\tx\nt-0a0b0c\tin_progress\t2026-10-21 09:00'
+  export GH_MOCK_RUNS=$'usb-fix-8b20e4\tsuccess\tOct 20 14:03\nbad id\tfailure\tx\nt-0a0b0c\tin_progress\tOct 21 09:00'
   out="$(printf '2\n' | script -qec "$SUBMIT status" /dev/null 2>&1)" || die "$out"
   contains "$out" "  1) usb-fix-8b20e4"
   contains "$out" "  2) t-0a0b0c"
@@ -697,6 +698,23 @@ test_pick_task() {
 
   out="$(printf '3\n' | script -qec "$SUBMIT status" /dev/null 2>&1)" && die "accepted an out-of-range pick"
   contains "$out" "no task numbered '3'"
+}
+
+test_pick_task_continue_open_prs_only() {
+  published_task
+  git checkout -q main
+  local out
+  export GH_MOCK_RUNS=$'t-111111\tsuccess\tOct 21 10:00\ngone-222222\tsuccess\tOct 21 09:00\nt-333333\tsuccess\tOct 20 09:00'
+  export GH_MOCK_OPEN_BRANCHES=$'task-t\ntask-other'
+  out="$(printf '\n' | script -qec "$SUBMIT continue" /dev/null 2>&1)"
+  contains "$out" "  1) t-111111"
+  grep -q "gone-222222\|t-333333" <<< "$out" && die "listed a task without an open PR, or an older run of one"
+  contains "$(cat "$SB_CLAUDE_MSG")" "continuing task t-111111"
+
+  git checkout -q main
+  GH_MOCK_OPEN_BRANCHES= out="$(printf '\n' | script -qec "$SUBMIT continue" /dev/null 2>&1)" \
+    && die "continued with no open PRs"
+  contains "$out" "no recent tasks with an open PR"
 }
 
 # --- the .claude-task/ folder ------------------------------------------------------------------
