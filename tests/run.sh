@@ -60,9 +60,22 @@ case "$1 $2" in
   "workflow run") [[ ${GH_MOCK_FAIL-} == workflow ]] && { echo "HTTP 422" >&2; exit 1; }; exit 0 ;;
   "run list") echo "123 https://github.com/test/repo/actions/runs/123" ;;
   "pr create") [[ ${GH_MOCK_FAIL-} == pr ]] && exit 1; echo "https://github.com/test/repo/pull/1" ;;
+  "pr comment") exit 0 ;;
+  "pr list")
+    case "$*" in
+      *number,title,state*) printf '%s\n' "${GH_MOCK_PR-OPEN	12	fix the thing}" ;;
+      *isCrossRepository*|*"--json url --jq"*) echo "${GH_MOCK_PR_URL-https://github.com/test/repo/pull/12}" ;;
+    esac ;;
+  "run download")
+    while [[ $# -gt 0 && $1 != -D ]]; do shift; done
+    cp "$GH_MOCK_ARTIFACT"/* "$2" ;;
 esac
 EOF
   chmod +x "$SB/bin/gh"
+  # stands in for the interactive Claude Code that `continue` starts
+  printf '#!/usr/bin/env bash\npwd > "$SB_CLAUDE_CWD"\nprintf "%%s" "$1" > "$SB_CLAUDE_MSG"\n' > "$SB/bin/claude"
+  chmod +x "$SB/bin/claude"
+  export SB_CLAUDE_CWD="$SB/claude-cwd" SB_CLAUDE_MSG="$SB/claude-msg" GH_MOCK_ARTIFACT="$SB/out"
 }
 
 # FAKE_CLAUDE: edit (default) | none | fail | error-result | protected | hook | secret
@@ -86,11 +99,29 @@ printf '%s\n' "$@" > "$PWD/../claude-args"
 } > "$PWD/../claude-env"
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
 result() {
-  jq -nc --arg subtype "$1" --argjson is_error "$2" --arg report "${FAKE_REPORT-$'Commit: change a; add src/new\n\n## Summary\nreport'}" \
-    '{type: "result", subtype: $subtype, is_error: $is_error, result: $report, num_turns: 2, total_cost_usd: 0.01, duration_ms: 1500}'
+  jq -nc --arg subtype "$1" --argjson is_error "$2" --arg report "${FAKE_REPORT-$DEFAULT_REPORT}" \
+    '{type: "result", subtype: $subtype, is_error: $is_error, result: $report, num_turns: 2,
+      total_cost_usd: 3.4, duration_ms: 872000, duration_api_ms: 725000,
+      usage: {input_tokens: 1000, cache_read_input_tokens: 1900000, cache_creation_input_tokens: 99000, output_tokens: 38500},
+      modelUsage: {"claude-haiku": {costUSD: 0.1}, "claude-opus": {costUSD: 3.3}}}'
 }
+DEFAULT_REPORT='Commit: change a; add src/new
+
+## Summary
+report
+
+## Files changed
+- `a.txt`: append a | line
+- `./src/new.txt` — new file
+
+## Tests run
+none
+<!-- handoff -->
+## State
+handoff body'
+
 case "${FAKE_CLAUDE:-edit}" in
-  edit) echo "changed by claude" >> a.txt; mkdir -p src; echo new > src/new.txt; rm c.txt ;;
+  edit) echo "changed by claude" >> a.txt; mkdir -p src; echo new > src/new.txt; rm -f c.txt ;;
   none) ;;
   fail) exit 1 ;;
   error-result) result error_max_budget_usd true; exit 0 ;;
@@ -261,7 +292,7 @@ test_requires_main() {
   git checkout -qb feature
   local out
   out="$("$SUBMIT" --yes tasks/t.md 2>&1)" && die "submitted from feature"
-  contains "$out" "submit tasks from 'main'"
+  contains "$out" "submit new tasks from 'main', or follow-ups from a 'task-<name>' task branch"
   eq "$(git symbolic-ref --short HEAD)" feature
 }
 
@@ -491,6 +522,156 @@ test_ci_publish_rejects_tampered_patch() {
   local out
   out="$(CT_WORK="$SB/pub" "$CI" publish 2>&1)" && die "tampered patch published"
   contains "$out" "doesn't reproduce the validated tree"
+}
+
+test_ci_files_table_handoff_telemetry() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  local body
+  body="$(cat "$SB/out/pr-body.md")"
+  contains "$body" '| `a.txt` | +1 −0 | append a \| line |'
+  contains "$body" '| `src/new.txt` | +1 −0 (new) | new file |'
+  contains "$body" '| `c.txt` | +0 −1 (deleted) | ⚠ no note from Claude |'
+  grep -q '^| `tasks/t.md`' <<< "$body" && die "dropped prompt listed in the table"
+  grep -q '^## Files changed' <<< "$body" && die "Files changed section kept next to the table"
+  grep -q '^## Tests run' <<< "$body" || die "report sections after Files changed dropped"
+  eq "$(cat "$SB/out/handoff.md")" $'## State\nhandoff body' "handoff split"
+  grep -q 'handoff -->' "$SB/out/claude-report.md" && die "marker left in the report"
+  contains "$body" "<details><summary>Handoff notes</summary>"
+  grep -qE '^<sub>14m 32s \(12m 5s API\) · 2 turns · 2M in \(95% cached\) / 38k out · \$3\.40 · claude-opus · setup [0-9]+s · validate [0-9]+s</sub>$' <<< "$body" \
+    || die "telemetry: $(tail -n 1 <<< "$body")"
+
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  unset ANTHROPIC_API_KEY
+  export CLAUDE_CODE_OAUTH_TOKEN=dummy
+  FAKE_REPORT=$'Commit: x\n\n## Files changed\nfree-form prose' pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  body="$(cat "$SB/out/pr-body.md")"
+  contains "$body" '$3.40 API-equiv (subscription)'
+  contains "$body" 'free-form prose'
+  contains "$body" '| `a.txt` | +1 −0 | ⚠ no note from Claude |'
+  grep -q 'Handoff notes' <<< "$body" && die "empty handoff shown"
+  [[ -e $SB/out/handoff.md && ! -s $SB/out/handoff.md ]] || die "handoff.md missing or not empty"
+}
+
+# a published task-t with its result branch checked out locally
+published_task() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  : > "$GH_LOG"
+  git fetch -q origin task-t
+  git checkout -q task-t
+}
+
+test_followup_submit_and_publish() {
+  published_task
+  local tip
+  tip="$(git rev-parse HEAD)"
+  echo "my tweak" >> b.txt
+  echo 'follow up' > tasks/f.md
+  submit tasks/f.md
+  contains "$OUT" 'follow-up on task-t → adds a commit to PR #12 "fix the thing"'
+  contains "$OUT" "base:     $tip (task-t, in sync with origin)"
+  [[ $TASK_ID == t-* ]] || die "task id $TASK_ID"
+  grep -q -- "-f task_name=t -f task_id=$TASK_ID -f followup=true$" "$GH_LOG" || die "$(cat "$GH_LOG")"
+
+  ci_env tasks/f.md
+  export CT_FOLLOWUP=true
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  local new
+  new="$(git ls-remote origin refs/heads/task-t | cut -f1)"
+  git fetch -q origin task-t
+  eq "$(git rev-parse "$new^")" "$SNAP_SHA" "follow-up commit's parent"
+  eq "$(git rev-parse "$SNAP_SHA^")" "$tip" "snapshot's parent"
+  grep -q "^pr comment https://github.com/test/repo/pull/12 --repo test/repo --body-file" "$GH_LOG" || die "$(cat "$GH_LOG")"
+  grep -q "^pr create" "$GH_LOG" && die "opened a second PR"
+  contains "$(cat "$SB/out/pr-body.md")" "### Follow-up task \`$TASK_ID\`"
+  eq "$(snap)" "" "snapshot not cleaned up"
+}
+
+test_followup_ahead_warns() {
+  published_task
+  echo local > d.txt && git add d.txt && git commit -qm local
+  echo 'follow up' > tasks/f.md
+  submit tasks/f.md
+  contains "$OUT" "1 commit(s) ahead of origin"
+  contains "$OUT" "HEAD has commits not on origin/task-t"
+}
+
+test_followup_refusals() {
+  published_task
+  echo 'follow up' > tasks/f.md
+  local out
+  out="$("$SUBMIT" --yes tasks/f.md other 2>&1)" && die "accepted another task name"
+  contains "$out" "keeps its branch's task name 't'"
+  out="$(GH_MOCK_PR=$'MERGED\t12\tx' "$SUBMIT" --yes tasks/f.md 2>&1)" && die "submitted to a merged PR"
+  contains "$out" "PR #12 for 'task-t' is merged"
+  out="$(GH_MOCK_PR= "$SUBMIT" --yes tasks/f.md 2>&1)" && die "submitted without a PR"
+  contains "$out" "'task-t' has no PR into main"
+  git push -q origin "$(git commit-tree "HEAD^{tree}" -p HEAD -m remote):refs/heads/task-t"
+  out="$("$SUBMIT" --yes tasks/f.md 2>&1)" && die "submitted behind the remote"
+  contains "$out" "origin/task-t has commits this branch doesn't"
+  git checkout -qb task-gone
+  out="$("$SUBMIT" --yes tasks/f.md 2>&1)" && die "submitted from an unpublished branch"
+  contains "$out" "'task-gone' isn't on origin"
+  eq "$(snap)" "" "nothing pushed"
+}
+
+test_followup_publish_never_rewrites() {
+  published_task
+  echo 'follow up' > tasks/f.md
+  submit tasks/f.md
+  ci_env tasks/f.md
+  export CT_FOLLOWUP=true
+  local moved
+  moved="$(git commit-tree "HEAD^{tree}" -p HEAD -m elsewhere)"
+  git push -q origin "$moved:refs/heads/task-t"
+  pipeline > "$SB/log" 2>&1 && die "published over a moved branch"
+  grep -q "it has commits the snapshot doesn't include" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(git ls-remote origin refs/heads/task-t | cut -f1)" "$moved" "branch rewritten"
+  [[ -n $(snap) ]] || die "snapshot removed"
+
+  ci_env tasks/f.md
+  GH_MOCK_PR_URL= pipeline > "$SB/log" 2>&1 && die "published without an open PR"
+  grep -q "task-t has no open PR into main" "$SB/log" || die "$(cat "$SB/log")"
+}
+
+test_continue() {
+  published_task
+  git checkout -q main
+  # info/exclude is shared by all worktrees, unlike a commit on main
+  echo .claude-task/handoff/ >> .git/info/exclude
+  local id=$TASK_ID out
+  echo dirty >> a.txt
+  out="$("$SUBMIT" continue "$id" 2>&1)" && die "continued over a dirty tree"
+  contains "$out" "rerun with --worktree"
+  eq "$(git symbolic-ref --short HEAD)" main
+
+  out="$("$SUBMIT" --worktree continue "$id" 2>&1)" || die "$out"
+  local wt="$REPO-task-t"
+  eq "$(git -C "$wt" symbolic-ref --short HEAD)" task-t
+  eq "$(git -C "$wt" rev-parse HEAD)" "$(git ls-remote origin refs/heads/task-t | cut -f1)" "worktree tip"
+  eq "$(cat "$wt/.claude-task/handoff/$id.md")" $'## State\nhandoff body' "handoff notes"
+  eq "$(cat "$SB_CLAUDE_CWD")" "$wt" "claude cwd"
+  contains "$(cat "$SB_CLAUDE_MSG")" ".claude-task/handoff/$id.md"
+  contains "$(cat "$SB_CLAUDE_MSG")" "PR https://github.com/test/repo/pull/12"
+  eq "$(git -C "$wt" status --porcelain)" "" "handoff not ignored"
+  eq "$(ls -A "$TMPDIR")" "" "temp files left behind"
+
+  git checkout -q a.txt
+  git worktree remove "$wt"
+  out="$("$SUBMIT" continue "$id" 2>&1)" || die "$out"
+  eq "$(git symbolic-ref --short HEAD)" task-t
+  eq "$(cat "$SB_CLAUDE_CWD")" "$REPO" "claude cwd"
+  [[ -s .claude-task/handoff/$id.md ]] || die "no handoff in the checkout"
 }
 
 # --- the .claude-task/ folder ------------------------------------------------------------------

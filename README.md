@@ -9,6 +9,17 @@ submit-task add-feature                # runs .claude-task/tasks/add-feature.md
 submit-task docs/spec.md my-feature    # any Markdown file in the repo, explicit task name
 submit-task status <task-id>           # the workflow run and its PR
 submit-task logs <task-id>             # full run log
+submit-task continue <task-id>         # check out the result branch and resume in Claude Code
+```
+
+Submitting from the base branch starts a new task and opens a PR. Submitting from a task's result
+branch (`task-<name>`, e.g. after `continue`) is a follow-up: Claude's work becomes a new commit
+on that branch and the report a comment on its open PR. The confirmation names which one it is:
+
+```
+follow-up on task-usb-fix → adds a commit to PR #12 "fix usb enumeration on reconnect"
+task:     usb-fix-8b20e4
+base:     a41d9e0... (task-usb-fix, in sync with origin)
 ```
 
 ## What a repo carries
@@ -208,6 +219,26 @@ Claude's work. The PR body lists both parts separately, along with the task ID, 
 link, the prompt and Claude's report. For a PR with only Claude's edits, push your local changes
 to the base branch before submitting.
 
+Claude's changes are shown as a table of every changed file with git's line counts and Claude's
+one-line note for it; a file without a note is flagged. Below the report come Claude's handoff
+notes (collapsed) and one line of telemetry: wall and API time, turns, tokens with the cache hit
+rate, cost, the main model, and the setup and validate hooks' run times. With
+`CLAUDE_CODE_OAUTH_TOKEN` the cost is what the API would have charged, not a bill.
+
+### Follow-ups and `continue`
+
+`submit-task continue <task-id>` fetches the task's result branch and checks it out (or, with
+`--worktree`, adds a worktree at `<repo>-task-<name>` next to the checkout, for when your tree has
+changes). It saves the run's handoff notes to `.claude-task/handoff/<task-id>.md` (gitignored by
+`init` since v1.7.0; add `handoff/` to `.claude-task/.gitignore` in older setups) and starts
+Claude Code with a message pointing at them. The artifact holding the notes expires after 14 days.
+
+From that branch, `submit-task` submits a follow-up. The CLI requires the branch to be on the
+remote with an open PR, and your checkout to contain the remote tip. The publish job pushes
+without force, so if the branch gained commits the snapshot lacks, the push is refused and nothing
+is lost. The PR keeps its title and body; each follow-up adds a comment with the same sections as
+the PR body.
+
 ## Recovery
 
 - **Dispatch failed after the push:** the snapshot branch is kept, and `submit-task` prints the
@@ -240,8 +271,8 @@ to the base branch before submitting.
 - Submodules, nested repositories and Git LFS files are rejected rather than half-uploaded.
 - Artifacts and logs are as visible as the consuming repository. On a public repo, anyone can
   read them, including Claude's transcript.
-- `submit-task` must be run from the base branch. Commits on it that aren't pushed yet go up with
-  the snapshot and show up in the PR (the CLI warns).
+- `submit-task` must be run from the base branch or a task's result branch. Commits on it that
+  aren't pushed yet go up with the snapshot and show up in the PR (the CLI warns).
 - The local CLI and the pinned workflow share only the dispatch inputs and the `.claude-task/`
   layout. Keep your runner clone at or near the pinned version.
 

@@ -15,11 +15,14 @@ usage() {
 usage: $PROG [-y] <name | prompt.md> [task-name]   snapshot the working tree and run the task in CI
        $PROG status <task-id>                     show the task's workflow run and PR
        $PROG logs <task-id>                       print the task's workflow run log
+       $PROG continue [-w] <task-id>              check out the task's branch and resume in Claude Code
        $PROG init                                 add the runner's files to this repo
 
-  <name> is shorthand for $CT_TASKS_DIR/<name>.md
+  <name> is shorthand for $CT_TASKS_DIR/<name>.md. Submitting from the base branch starts a new
+  task and PR; submitting from a task's result branch adds a commit to its open PR.
 
-  -y, --yes   don't ask for confirmation before pushing the snapshot
+  -y, --yes        don't ask for confirmation before pushing the snapshot
+  -w, --worktree   continue in a new worktree next to this checkout instead of switching branches
 EOF
   exit 2
 }
@@ -63,6 +66,70 @@ cmd_status_or_logs() {
   echo "result branch: $prefix$(ct_task_name_of "$task_id")"
   gh pr list -R "$slug" --head "$prefix$(ct_task_name_of "$task_id")" --state all \
     --json url,state --jq '.[] | "PR: \(.url) (\(.state))"'
+}
+
+# Checks out the task's result branch (or adds a worktree for it), saves the run's handoff notes
+# under the gitignored handoff folder and starts Claude Code on them.
+cmd_continue() {
+  local task_id=$1 worktree=$2 root prefix branch slug run notes target dest rel pr
+  ct_valid_task_id "$task_id" || ct_die "invalid task id: $task_id"
+  require_gh
+  root="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
+  root="$(realpath -e "$root")"
+  cd "$root"
+  prefix="$(ct_conf_get "$root/$CT_CONF_PATH" RESULT_BRANCH_PREFIX)"
+  branch="$prefix$(ct_task_name_of "$task_id")"
+  slug="$(repo_slug)"
+  if [[ $worktree -eq 1 ]]; then
+    target="$root-${branch//\//-}"
+  else
+    target=$root
+    [[ $(git symbolic-ref --quiet --short HEAD || true) == "$branch" || -z $(git status --porcelain --untracked-files=no) ]] \
+      || ct_die "the working tree has changes; commit or stash them, or rerun with --worktree"
+  fi
+
+  run="$(find_run "$slug" "$CT_WORKFLOW" "$task_id")"
+  [[ -n $run ]] || ct_die "no '$CT_WORKFLOW' run found for task $task_id"
+  git fetch -q "$REMOTE" "+refs/heads/$branch:refs/remotes/$REMOTE/$branch" 2>/dev/null \
+    || ct_die "'$branch' isn't on $REMOTE (still running, failed, or no changes?); see: $PROG status $task_id"
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  gh run download "${run%% *}" -R "$slug" -n "claude-task-$task_id" -D "$tmp" >/dev/null \
+    || ct_die "couldn't download the run's artifact claude-task-$task_id (it expires after 14 days)"
+  # runs from runners before v1.7.0 have no handoff notes; the report is the next best thing
+  notes="$tmp/handoff.md"
+  [[ -s $notes ]] || notes="$tmp/claude-report.md"
+  [[ -s $notes ]] || ct_die "the run's artifact has no handoff notes or report"
+
+  if [[ $worktree -eq 0 ]]; then
+    git checkout -q "$branch"
+  elif [[ ! -e $target ]]; then
+    git worktree add -q "$target" "$branch"
+  elif [[ $(git -C "$target" symbolic-ref --quiet --short HEAD 2>/dev/null) != "$branch" ]]; then
+    ct_die "$target exists but isn't a checkout of $branch"
+  fi
+  git -C "$target" merge -q --ff-only "$REMOTE/$branch" \
+    || ct_die "local $branch has diverged from $REMOTE/$branch; reconcile them first"
+
+  rel="$CT_DIR/handoff/$task_id.md"
+  dest="$target/$rel"
+  mkdir -p "$(dirname "$dest")"
+  cp "$notes" "$dest"
+  git -C "$target" check-ignore -q "$rel" \
+    || ct_warn "$rel isn't gitignored; add 'handoff/' to $CT_DIR/.gitignore"
+  pr="$(gh pr list -R "$slug" --head "$branch" --state all --json url --jq '.[0].url // empty' || true)"
+
+  echo "branch:   $branch ($(git -C "$target" rev-parse --short HEAD)) in $target"
+  echo "handoff:  $rel"
+  [[ -z $pr ]] || echo "PR:       $pr"
+  # exec skips the EXIT trap
+  rm -rf "$tmp"
+  trap - EXIT
+  cd "$target"
+  exec claude "You're continuing task $task_id on branch $branch${pr:+ (PR $pr)}. A Claude session in CI did \
+the work so far and left handoff notes in $rel. Read them and the latest commit (git show --stat \
+HEAD), then briefly summarize where things stand and wait for my instructions."
 }
 
 # resolves the prompt argument (relative to the caller's cwd) to a safe repo-relative path
@@ -151,7 +218,7 @@ EOF
 cmd_submit() {
   local assume_yes=$1 prompt_arg=$2 name_arg=${3-}
   local root conf base_branch prefix workflow=$CT_WORKFLOW branch base_sha task_name task_id rel
-  local force=""
+  local force="" followup=0 remote_sha="" pr_line pr_state pr_num pr_title upstream
   local tree tree2 attempt snapshot_sha snapshot_ref result_branch slug changes nchanges
 
   root="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
@@ -166,9 +233,15 @@ cmd_submit() {
     || ct_die "this repo isn't set up for the task runner; run '$PROG init', fill in $CT_VALIDATE_PATH and push"
 
   branch="$(git symbolic-ref --quiet --short HEAD)" || ct_die "HEAD is detached; check out $base_branch first"
-  [[ $branch == "$base_branch" ]] || ct_die "current branch is '$branch'; submit tasks from '$base_branch'"
-
-  if [[ -n $name_arg ]]; then
+  if [[ $branch != "$base_branch" ]]; then
+    [[ -n $prefix && $branch == "$prefix"* ]] \
+      || ct_die "current branch is '$branch'; submit new tasks from '$base_branch', or follow-ups from a '$prefix<name>' task branch"
+    followup=1
+    task_name="${branch#"$prefix"}"
+    ct_valid_task_name "$task_name" || ct_die "'$branch' isn't a task branch: '$task_name' isn't a valid task name"
+    [[ -z $name_arg || $name_arg == "$task_name" ]] \
+      || ct_die "a follow-up keeps its branch's task name '$task_name'; drop '$name_arg'"
+  elif [[ -n $name_arg ]]; then
     ct_valid_task_name "$name_arg" || ct_die "invalid task name '$name_arg': use 1-40 of [a-z0-9-], starting and ending with a letter or digit"
     task_name=$name_arg
   else
@@ -190,6 +263,25 @@ cmd_submit() {
 
   slug="$(repo_slug)"
   require_gh
+
+  if [[ $followup -eq 1 ]]; then
+    remote_sha="$(git ls-remote "$REMOTE" "refs/heads/$branch" | cut -f1)"
+    [[ -n $remote_sha ]] || ct_die "'$branch' isn't on $REMOTE; follow-ups go to a published task branch"
+    git cat-file -e "$remote_sha^{commit}" 2>/dev/null || git fetch -q "$REMOTE" "$branch" \
+      || ct_die "fetching $REMOTE/$branch failed"
+    git merge-base --is-ancestor "$remote_sha" HEAD \
+      || ct_die "$REMOTE/$branch has commits this branch doesn't; pull them first (git pull --ff-only)"
+    # prefer an open PR when the branch name was reused
+    pr_line="$(gh pr list -R "$slug" --head "$branch" --base "$base_branch" --state all \
+      --json number,title,state,isCrossRepository \
+      --jq 'map(select(.isCrossRepository | not)) | (map(select(.state == "OPEN")) + .) | .[0]
+              // empty | "\(.state)\t\(.number)\t\(.title)"')" || ct_die "looking up the PR for $branch failed"
+    IFS=$'\t' read -r pr_state pr_num pr_title <<< "$pr_line"
+    [[ -n $pr_state ]] || ct_die "'$branch' has no PR into $base_branch; submit new tasks from '$base_branch'"
+    [[ $pr_state == OPEN ]] || ct_die "PR #$pr_num for '$branch' is $(tr "[:upper:]" "[:lower:]" <<< "$pr_state"); submit new tasks from '$base_branch'"
+  elif git ls-remote --exit-code "$REMOTE" "refs/heads/$result_branch" >/dev/null 2>&1; then
+    ct_die "result branch '$result_branch' already exists on $REMOTE; pick another task name"
+  fi
 
   # global so the EXIT trap still sees it after this function returns
   tmp="$(mktemp -d)"
@@ -218,8 +310,15 @@ cmd_submit() {
 
   changes="$(git diff --name-status --no-renames "$base_sha" "$tree")"
   nchanges="$(printf '%s' "$changes" | grep -c '' || true)"
+  if [[ $followup -eq 1 ]]; then
+    echo "follow-up on $branch → adds a commit to PR #$pr_num \"$pr_title\""
+    if [[ $base_sha == "$remote_sha" ]]; then upstream="in sync with $REMOTE"
+    else upstream="$(git rev-list --count "$remote_sha..$base_sha") commit(s) ahead of $REMOTE"; fi
+  else
+    echo "new task → opens a PR into $base_branch"
+  fi
   echo "task:     $task_id"
-  echo "base:     $base_sha ($base_branch)"
+  echo "base:     $base_sha ($branch${upstream:+, $upstream})"
   echo "prompt:   $rel"
   if [[ $nchanges -eq 0 ]]; then
     echo "changes:  none (snapshot tree equals HEAD)"
@@ -228,13 +327,12 @@ cmd_submit() {
     printf '%s\n' "$changes" | head -n 40 | sed 's/^/  /'
     [[ $nchanges -le 40 ]] || echo "  ... and $((nchanges - 40)) more"
   fi
-  if git rev-parse --verify --quiet "refs/remotes/$REMOTE/$base_branch" >/dev/null \
+  if [[ $followup -eq 1 ]]; then
+    [[ $base_sha == "$remote_sha" ]] \
+      || ct_warn "HEAD has commits not on $REMOTE/$branch; they'll be pushed with the snapshot and show up in the PR"
+  elif git rev-parse --verify --quiet "refs/remotes/$REMOTE/$base_branch" >/dev/null \
      && ! git merge-base --is-ancestor "$base_sha" "refs/remotes/$REMOTE/$base_branch"; then
     ct_warn "HEAD has commits not on $REMOTE/$base_branch (as of your last fetch); they'll be pushed with the snapshot and show up in the PR"
-  fi
-
-  if git ls-remote --exit-code "$REMOTE" "refs/heads/$result_branch" >/dev/null 2>&1; then
-    ct_die "result branch '$result_branch' already exists on $REMOTE; pick another task name"
   fi
 
   if [[ $assume_yes -eq 0 ]]; then
@@ -257,6 +355,8 @@ cmd_submit() {
     -f "snapshot_ref=$snapshot_ref" -f "snapshot_sha=$snapshot_sha" -f "prompt_path=$rel"
     -f "task_name=$task_name" -f "task_id=$task_id"
   )
+  # only sent when set, so new tasks still dispatch to workflows generated before the input existed
+  [[ $followup -eq 0 ]] || inputs+=(-f followup=true)
   if ! gh workflow run "$workflow" -R "$slug" --ref "$base_branch" "${inputs[@]}"; then
     cat >&2 <<EOF
 claude-task: dispatching $workflow failed; the snapshot is kept at $REMOTE/$snapshot_ref.
@@ -282,10 +382,12 @@ EOF
 }
 
 assume_yes=0
+worktree=0
 args=()
 for a in "$@"; do
   case "$a" in
     -y|--yes) assume_yes=1 ;;
+    -w|--worktree) worktree=1 ;;
     -h|--help) usage ;;
     -*) usage ;;
     *) args+=("$a") ;;
@@ -301,6 +403,10 @@ case "${args[0]}" in
   status|logs)
     [[ ${#args[@]} -eq 2 ]] || usage
     cmd_status_or_logs "${args[0]}" "${args[1]}"
+    ;;
+  continue)
+    [[ ${#args[@]} -eq 2 ]] || usage
+    cmd_continue "${args[1]}" "$worktree"
     ;;
   *)
     [[ ${#args[@]} -le 2 ]] || usage

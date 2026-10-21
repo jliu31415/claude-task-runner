@@ -1,2 +1,4 @@
 # task prompts (submit-task <name> reads tasks/<name>.md); the runner uploads them on submit
 tasks/
+# handoff notes that `submit-task continue` downloads from a task's run
+handoff/

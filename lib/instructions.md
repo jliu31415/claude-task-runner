@@ -18,6 +18,22 @@ How to work:
 
 Finish with a short report in Markdown. Its first line is `Commit: <message>`, the commit message
 and pull request title for your change: one line in the imperative mood, as brief as you can
-make it (aim for under 72 characters); separate unrelated changes with `;`. Then the sections
-Summary, Files changed, Tests run (commands and results), Known limitations. The report minus
-the Commit line is posted on the pull request as written.
+make it (aim for under 72 characters); separate unrelated changes with `;`. Then these sections:
+- `## Summary`
+- `## Files changed`: exactly one bullet per changed file, formatted as
+  ``- `path/from/repo/root`: what changed and why``, one line each. The runner turns it into a
+  table next to each file's line counts.
+- `## Tests run`: commands and results.
+- `## Known limitations`
+
+The report minus the Commit line is posted on the pull request as written.
+
+After the report, write a line containing only `<!-- handoff -->`, then handoff notes for the
+developer who continues this work in a local Claude Code session. That session starts from these
+notes alone, on a checkout of your changes, so make them complete but compact:
+- what you did and the current state
+- what you tried and ruled out, and why
+- decisions you made without the user, and open questions
+- concrete next steps
+- commands, log locations and gotchas that saved you time
+Don't repeat the report; the handoff is posted on the pull request in a collapsed section.

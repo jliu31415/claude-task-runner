@@ -26,6 +26,11 @@ on:
         description: Unique task ID (<task_name>-<6 hex>)
         type: string
         required: true
+      followup:
+        description: Add to the existing result branch and its open PR
+        type: boolean
+        required: false
+        default: false
 
 permissions: {}
 
@@ -42,6 +47,7 @@ jobs:
       prompt_path: ${{ inputs.prompt_path }}
       task_name: ${{ inputs.task_name }}
       task_id: ${{ inputs.task_id }}
+      followup: ${{ inputs.followup }}
     secrets:
       # not needed with workload identity federation (.claude-task/config)
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

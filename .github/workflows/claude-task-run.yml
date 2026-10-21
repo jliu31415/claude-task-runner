@@ -22,6 +22,11 @@ on:
       task_id:
         type: string
         required: true
+      followup:
+        description: Add to the existing result branch and its open PR instead of creating them
+        type: boolean
+        required: false
+        default: false
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -49,6 +54,7 @@ env:
   CT_PROMPT_PATH: ${{ inputs.prompt_path }}
   CT_TASK_NAME: ${{ inputs.task_name }}
   CT_TASK_ID: ${{ inputs.task_id }}
+  CT_FOLLOWUP: ${{ inputs.followup }}
 
 jobs:
   run:
@@ -131,6 +137,10 @@ jobs:
             out/tree
             out/files.txt
             out/claude-report.md
+            out/claude-result.json
+            out/handoff.md
+            out/setup-seconds
+            out/validate-seconds
           if-no-files-found: error
           retention-days: 14
 
