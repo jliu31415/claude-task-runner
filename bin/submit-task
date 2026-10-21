@@ -13,13 +13,14 @@ PROG=submit-task
 usage() {
   cat >&2 <<EOF
 usage: $PROG [-y] <name | prompt.md> [task-name]   snapshot the working tree and run the task in CI
-       $PROG status <task-id>                     show the task's workflow run and PR
-       $PROG logs <task-id>                       print the task's workflow run log
-       $PROG continue [-w] <task-id>              check out the task's branch and resume in Claude Code
+       $PROG status [task-id]                     show the task's workflow run and PR
+       $PROG logs [task-id]                       print the task's workflow run log
+       $PROG continue [-w] [task-id]              check out the task's branch and resume in Claude Code
        $PROG init                                 add the runner's files to this repo
 
   <name> is shorthand for $CT_TASKS_DIR/<name>.md. Submitting from the base branch starts a new
-  task and PR; submitting from a task's result branch adds a commit to its open PR.
+  task and PR; submitting from a task's result branch adds a commit to its open PR. Without a
+  task id, status, logs and continue list the recent tasks to pick from.
 
   -y, --yes        don't ask for confirmation before pushing the snapshot
   -w, --worktree   continue in a new worktree next to this checkout instead of switching branches
@@ -47,6 +48,29 @@ find_run() {
   gh run list -R "$slug" -w "$workflow" -e workflow_dispatch -L 50 \
     --json databaseId,url,displayTitle \
     --jq ".[] | select(.displayTitle == \"Claude task $task_id\") | \"\(.databaseId) \(.url)\"" | head -n1
+}
+
+# lists the repo's recent tasks on the terminal and prints the id of the one picked
+pick_task() {
+  local slug=$1 runs reply i id state created
+  local -a ids=()
+  [[ -t 0 ]] || ct_die "not a terminal; pass a task id"
+  runs="$(gh run list -R "$slug" -w "$CT_WORKFLOW" -e workflow_dispatch -L 20 \
+    --json displayTitle,status,conclusion,createdAt \
+    --jq '.[] | select(.displayTitle | startswith("Claude task ")) | [(.displayTitle | ltrimstr("Claude task ")),
+            (if .status == "completed" then .conclusion else .status end), (.createdAt[0:16] | sub("T"; " "))] | @tsv')" \
+    || ct_die "listing the '$CT_WORKFLOW' runs failed"
+  while IFS=$'\t' read -r id state created; do
+    ct_valid_task_id "$id" || continue
+    ids+=("$id")
+    printf '%3d) %-48s %-12s %s UTC\n' "${#ids[@]}" "$id" "$state" "$created" >&2
+  done <<< "$runs"
+  [[ ${#ids[@]} -gt 0 ]] || ct_die "no '$CT_WORKFLOW' runs found"
+  read -r -p "task [1]: " reply
+  reply=${reply:-1}
+  [[ $reply =~ ^[0-9]+$ ]] && (( 10#$reply >= 1 && 10#$reply <= ${#ids[@]} )) \
+    || ct_die "no task numbered '$reply'"
+  echo "${ids[10#$reply - 1]}"
 }
 
 cmd_status_or_logs() {
@@ -400,13 +424,19 @@ case "${args[0]}" in
     [[ ${#args[@]} -eq 1 ]] || usage
     cmd_init
     ;;
-  status|logs)
-    [[ ${#args[@]} -eq 2 ]] || usage
-    cmd_status_or_logs "${args[0]}" "${args[1]}"
-    ;;
-  continue)
-    [[ ${#args[@]} -eq 2 ]] || usage
-    cmd_continue "${args[1]}" "$worktree"
+  status|logs|continue)
+    [[ ${#args[@]} -le 2 ]] || usage
+    task_id=${args[1]-}
+    if [[ -z $task_id ]]; then
+      require_gh
+      slug="$(repo_slug)"
+      task_id="$(pick_task "$slug")"
+    fi
+    if [[ ${args[0]} == continue ]]; then
+      cmd_continue "$task_id" "$worktree"
+    else
+      cmd_status_or_logs "${args[0]}" "$task_id"
+    fi
     ;;
   *)
     [[ ${#args[@]} -le 2 ]] || usage

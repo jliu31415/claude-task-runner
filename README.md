@@ -7,9 +7,9 @@ your local working tree, and get the result back as a pull request.
 submit-task init                       # once per repo: scaffold .claude-task/ and the workflow
 submit-task add-feature                # runs .claude-task/tasks/add-feature.md
 submit-task docs/spec.md my-feature    # any Markdown file in the repo, explicit task name
-submit-task status <task-id>           # the workflow run and its PR
-submit-task logs <task-id>             # full run log
-submit-task continue <task-id>         # check out the result branch and resume in Claude Code
+submit-task status [task-id]           # the workflow run and its PR (no id: pick from a list)
+submit-task logs [task-id]             # full run log
+submit-task continue [task-id]         # check out the result branch and resume in Claude Code
 ```
 
 Submitting from the base branch starts a new task and opens a PR. Submitting from a task's result

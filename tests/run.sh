@@ -58,7 +58,11 @@ printf '%s\n' "$*" >> "$GH_LOG"
 case "$1 $2" in
   "auth status") [[ ${GH_MOCK_FAIL-} == auth ]] && exit 1; exit 0 ;;
   "workflow run") [[ ${GH_MOCK_FAIL-} == workflow ]] && { echo "HTTP 422" >&2; exit 1; }; exit 0 ;;
-  "run list") echo "123 https://github.com/test/repo/actions/runs/123" ;;
+  "run list")
+    case "$*" in
+      *conclusion*) printf '%s\n' "${GH_MOCK_RUNS-}" ;;
+      *) echo "123 https://github.com/test/repo/actions/runs/123" ;;
+    esac ;;
   "pr create") [[ ${GH_MOCK_FAIL-} == pr ]] && exit 1; echo "https://github.com/test/repo/pull/1" ;;
   "pr comment") exit 0 ;;
   "pr list")
@@ -672,6 +676,27 @@ test_continue() {
   eq "$(git symbolic-ref --short HEAD)" task-t
   eq "$(cat "$SB_CLAUDE_CWD")" "$REPO" "claude cwd"
   [[ -s .claude-task/handoff/$id.md ]] || die "no handoff in the checkout"
+}
+
+test_pick_task() {
+  sandbox
+  local out
+  out="$("$SUBMIT" status < /dev/null 2>&1)" && die "picked without a terminal"
+  contains "$out" "not a terminal; pass a task id"
+
+  # script gives the CLI a terminal to prompt on
+  export GH_MOCK_RUNS=$'usb-fix-8b20e4\tsuccess\t2026-10-20 14:03\nbad id\tfailure\tx\nt-0a0b0c\tin_progress\t2026-10-21 09:00'
+  out="$(printf '2\n' | script -qec "$SUBMIT status" /dev/null 2>&1)" || die "$out"
+  contains "$out" "  1) usb-fix-8b20e4"
+  contains "$out" "  2) t-0a0b0c"
+  grep -q "bad id" <<< "$out" && die "listed an invalid task id"
+  contains "$out" "result branch: task-t"
+
+  out="$(printf '\n' | script -qec "$SUBMIT status" /dev/null 2>&1)" || die "$out"
+  contains "$out" "result branch: task-usb-fix"
+
+  out="$(printf '3\n' | script -qec "$SUBMIT status" /dev/null 2>&1)" && die "accepted an out-of-range pick"
+  contains "$out" "no task numbered '3'"
 }
 
 # --- the .claude-task/ folder ------------------------------------------------------------------
