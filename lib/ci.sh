@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # CI side of the Claude task runner; each phase is one workflow step (see claude-task-run.yml).
-#   inputs | verify | app-client <setup|publish> | hook <setup|validate> | claude | collect | publish
+#   inputs | verify | setup-app | hook setup | claude | publish
 # Environment:
 #   CT_CONF   trusted .claude-task/config from the dispatched commit, not the snapshot (may be absent)
 #   CT_WORK   checkout of the submitted snapshot
 #   CT_OUT    directory for the prompt, report and patch (uploaded as the task artifact)
 #   CT_SNAPSHOT_REF CT_SNAPSHOT_SHA CT_PROMPT_PATH CT_TASK_NAME CT_TASK_ID   workflow inputs
 #   CT_FOLLOWUP     true when the task adds to an existing result branch and its open PR
-#   CT_PUBLISH_APP_SLUG  the GitHub App publish pushes and opens PRs as (empty: the workflow's token)
 #   GITHUB_TRIGGERING_ACTOR  who dispatched the task; authors Claude's commit and is assigned the PR
 set -euo pipefail
 
@@ -22,13 +21,18 @@ CT_OIDC_AUDIENCE=https://api.anthropic.com
 CT_OIDC_REFRESH_SECONDS=${CT_OIDC_REFRESH_SECONDS:-120}
 # the job may hold id-token: write; untrusted code (hooks, Claude) runs without the request vars
 CT_NO_OIDC=(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN)
+# validation runs in Claude's step but needs none of its credentials
+CT_HOOK_ENV=("${CT_NO_OIDC[@]}" -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_IDENTITY_TOKEN_FILE)
+# how much of a failed validation's output goes back to Claude
+CT_VALIDATE_TAIL_LINES=200
+CT_VALIDATE_TAIL_BYTES=30000
 CT_PR_LABEL=claude-task
-CT_DEFAULT_COMMITTER=$'github-actions[bot]\t41898282+github-actions[bot]@users.noreply.github.com'
+CT_COMMITTER=$'github-actions[bot]\t41898282+github-actions[bot]@users.noreply.github.com'
 
 : "${CT_CONF:?}" "${CT_WORK:?}" "${CT_OUT:?}"
 : "${CT_SNAPSHOT_REF:?}" "${CT_SNAPSHOT_SHA:?}" "${CT_PROMPT_PATH:?}" "${CT_TASK_NAME:?}" "${CT_TASK_ID:?}"
 CT_FOLLOWUP=${CT_FOLLOWUP:-false}
-CT_REQUESTER=${GITHUB_TRIGGERING_ACTOR:-}
+CT_REQUESTER=${GITHUB_TRIGGERING_ACTOR:?}
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 mkdir -p "$CT_OUT"
@@ -134,44 +138,50 @@ phase_verify() {
 }
 
 # the client ID is an identifier, not a secret; the workflow mints the token from it and the key
-phase_app_client() {
-  local which=$1 key id
-  case "$which" in
-    setup|publish) key="${which^^}_GH_APP_CLIENT_ID" ;;
-    *) ct_die "unknown app: $which" ;;
-  esac
-  id="$(conf "$key")"
-  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "$key in $CT_CONF_PATH has unexpected characters"
+phase_setup_app() {
+  local id
+  id="$(conf SETUP_GH_APP_CLIENT_ID)"
+  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "SETUP_GH_APP_CLIENT_ID in $CT_CONF_PATH has unexpected characters"
   echo "client_id=$id" >> "$GITHUB_OUTPUT"
-  [[ -z $id ]] || echo "$which gets a GitHub App token (client $id)"
+  [[ -z $id ]] || echo "setup gets a GitHub App token (client $id)"
+}
+
+check_hook_script() {
+  [[ -f $CT_WORK/$1 && ! -L $CT_WORK/$1 ]] || ct_die "$1 is not a regular file in the snapshot"
+  [[ -x $CT_WORK/$1 ]] || ct_die "$1 is not executable"
 }
 
 phase_hook() {
-  local which=$1 script dirty start
-  case "$which" in
-    setup) script=$CT_SETUP_PATH ;;
-    validate) script=$CT_VALIDATE_PATH ;;
-    *) ct_die "unknown hook: $which" ;;
-  esac
-  if [[ ! -e $CT_WORK/$script && $which == setup ]]; then
-    echo "no $script; skipping setup"
+  local which=$1 dirty start
+  [[ $which == setup ]] || ct_die "unknown hook: $which"
+  if [[ ! -e $CT_WORK/$CT_SETUP_PATH ]]; then
+    echo "no $CT_SETUP_PATH; skipping setup"
     return
   fi
-  [[ -f $CT_WORK/$script && ! -L $CT_WORK/$script ]] || ct_die "$script is not a regular file in the snapshot"
-  [[ -x $CT_WORK/$script ]] || ct_die "$script is not executable"
-
-  echo "running $which hook: $script"
+  check_hook_script "$CT_SETUP_PATH"
+  echo "running setup hook: $CT_SETUP_PATH"
   start=$SECONDS
-  (cd "$CT_WORK" && "${CT_NO_OIDC[@]}" "./$script") || ct_die "$which hook $script failed"
-  echo $((SECONDS - start)) > "$CT_OUT/$which-seconds"
+  (cd "$CT_WORK" && "${CT_HOOK_ENV[@]}" "./$CT_SETUP_PATH") || ct_die "setup hook $CT_SETUP_PATH failed"
+  echo $((SECONDS - start)) > "$CT_OUT/setup-seconds"
+  dirty="$(git -C "$CT_WORK" status --porcelain --untracked-files=all)"
+  [[ -z $dirty ]] || { echo "$dirty" >&2; ct_die "setup hook changed tracked or unignored files (above); write outputs to ignored paths"; }
+}
 
-  if [[ $which == setup ]]; then
-    dirty="$(git -C "$CT_WORK" status --porcelain --untracked-files=all)"
-    [[ -z $dirty ]] || { echo "$dirty" >&2; ct_die "setup hook changed tracked or unignored files (above); write outputs to ignored paths"; }
-  elif [[ -f $CT_OUT/tree ]]; then
-    [[ $(worktree_tree) == "$(cat "$CT_OUT/tree")" ]] \
-      || ct_die "validation changed tracked or unignored files after the changes were collected"
-  fi
+# runs validate.sh on the collected tree, its output teed to validate.log; the run times add up
+# across attempts
+run_validate() {
+  local start status total
+  echo "running validate hook: $CT_VALIDATE_PATH"
+  start=$SECONDS
+  set +e
+  (cd "$CT_WORK" && "${CT_HOOK_ENV[@]}" "./$CT_VALIDATE_PATH") 2>&1 | tee "$CT_OUT/validate.log"
+  status=${PIPESTATUS[0]}
+  set -e
+  total=$(( $(cat "$CT_OUT/validate-seconds") + SECONDS - start ))
+  echo "$total" > "$CT_OUT/validate-seconds"
+  [[ $(worktree_tree) == "$(cat "$CT_OUT/tree")" ]] \
+    || ct_die "validation changed tracked or unignored files after the changes were collected"
+  return "$status"
 }
 
 # writes a fresh GitHub OIDC token for the Anthropic audience to $1, atomically and without echoing it
@@ -209,8 +219,68 @@ setup_wif() {
   echo "authenticating with workload identity federation (rule $ANTHROPIC_FEDERATION_RULE_ID)"
 }
 
+# prints $1 in a code fence longer than any backtick run in it, so the text can't close it early
+fenced() {
+  local fence='```'
+  while [[ $1 == *"$fence"* ]]; do fence+='`'; done
+  printf '%s\n%s\n%s\n' "$fence" "$1" "$fence"
+}
+
+# one Claude Code session (or a resumed one): prompt on stdin, the result line appended to
+# results.jsonl. Prints the session ID.
+claude_session() {
+  local status result is_error seen
+  seen="$(grep -c '' "$CT_OUT/transcript.jsonl" || true)"
+  set +e
+  (cd "$CT_WORK" && "${CT_NO_OIDC[@]}" "$CT_CLAUDE_BIN" "$@") \
+    | tee -a -p "$CT_OUT/transcript.jsonl" \
+    | jq -R --unbuffered -r 'fromjson? | select(.type == "assistant") | .message.content[]?
+        | if .type == "text" then .text
+          elif .type == "tool_use" then "> \(.name) \(.input.command // .input.file_path // .input.pattern // "")"
+          else empty end' >&2
+  status=${PIPESTATUS[0]}
+  set -e
+
+  result="$(tail -n "+$((seen + 1))" "$CT_OUT/transcript.jsonl" | jq -R -c 'fromjson? | select(.type == "result")' | tail -n1)"
+  [[ -n $result ]] || ct_die "Claude exited with status $status and produced no result"
+  echo "$result" >> "$CT_OUT/results.jsonl"
+  is_error="$(jq -r '.is_error' <<< "$result")"
+  jq -r '"claude: \(.subtype), \(.num_turns) turns, $\(.total_cost_usd // "?"), \((.duration_ms // 0) / 1000 | floor)s"' <<< "$result" >&2
+  [[ $status -eq 0 && $is_error == false ]] || ct_die "Claude failed (exit $status, is_error=$is_error)"
+  jq -r '.session_id // empty' <<< "$result"
+}
+
+# the message that resumes Claude's session after validation failed
+retry_prompt() {
+  local log
+  log="$(tail -n "$CT_VALIDATE_TAIL_LINES" "$CT_OUT/validate.log" | tail -c "$CT_VALIDATE_TAIL_BYTES")"
+  printf 'The runner ran `%s` on your changes and it failed. The end of its output:\n\n' "$CT_VALIDATE_PATH"
+  fenced "$log"
+  printf '\nFix the cause. Then finish with your full report again in the same format, including the\n'
+  printf 'handoff notes; it replaces your previous one. The runner validates again afterwards.\n'
+}
+
+# Claude's last result, with the usage of every attempt added up (for the telemetry line)
+merge_results() {
+  jq -s -c --arg auth "$1" '
+    def total(f): map(f | select(. != null)) | if . == [] then null else add end;
+    last + {
+      num_turns: total(.num_turns), total_cost_usd: total(.total_cost_usd),
+      duration_ms: total(.duration_ms), duration_api_ms: total(.duration_api_ms),
+      usage: {input_tokens: total(.usage.input_tokens), output_tokens: total(.usage.output_tokens),
+        cache_read_input_tokens: total(.usage.cache_read_input_tokens),
+        cache_creation_input_tokens: total(.usage.cache_creation_input_tokens)},
+      modelUsage: (map(.modelUsage // {} | to_entries[]) | group_by(.key)
+        | map({key: .[0].key, value: {costUSD: (map(.value.costUSD // 0) | add)}}) | from_entries),
+      ct_auth: $auth, ct_attempts: length
+    } | del(.result)' "$CT_OUT/results.jsonl"
+}
+
+# Claude works on the task, then the runner collects and validates the result. When validation
+# fails, the same session gets its output, up to VALIDATE_RETRIES more times.
 phase_claude() {
-  local bin=${CLAUDE_BIN:-} budget model instructions status result is_error auth=api
+  local bin=${CLAUDE_BIN:-} budget model instructions retries attempt=1 session spent left auth=api
+  check_hook_script "$CT_VALIDATE_PATH"
   CT_TMP="$(mktemp -d)"
   CT_OIDC_REFRESHER=""
   trap '[[ -z $CT_OIDC_REFRESHER ]] || kill "$CT_OIDC_REFRESHER" 2>/dev/null; rm -rf "$CT_TMP"' EXIT
@@ -225,6 +295,7 @@ phase_claude() {
     npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@$CT_CLAUDE_CODE_VERSION"
     bin=claude
   fi
+  CT_CLAUDE_BIN=$bin
 
   instructions="$CT_TMP/instructions.md"
   {
@@ -233,7 +304,7 @@ phase_claude() {
   } > "$instructions"
 
   local -a args=(
-    -p --output-format stream-json --verbose --no-session-persistence
+    -p --output-format stream-json --verbose
     --permission-mode dontAsk --allowedTools "$CT_CLAUDE_TOOLS"
     # project .claude/ settings come from the snapshot and may carry hooks; don't load them
     --setting-sources user
@@ -241,37 +312,50 @@ phase_claude() {
   )
   budget="$(conf CLAUDE_MAX_BUDGET_USD)"
   model="$(conf CLAUDE_MODEL)"
-  [[ -z $budget || $budget =~ ^[0-9]+(\.[0-9]+)?$ ]] || ct_die "CLAUDE_MAX_BUDGET_USD must be a number: $budget"
-  [[ -n $budget ]] && args+=(--max-budget-usd "$budget")
+  retries="$(conf VALIDATE_RETRIES)"
+  [[ $budget =~ ^[0-9]+(\.[0-9]+)?$ ]] || ct_die "CLAUDE_MAX_BUDGET_USD must be a number: $budget"
+  [[ $retries =~ ^[0-9]+$ ]] || ct_die "VALIDATE_RETRIES must be a whole number: $retries"
   [[ -n $model ]] && args+=(--model "$model")
 
-  set +e
-  (cd "$CT_WORK" && "${CT_NO_OIDC[@]}" "$bin" "${args[@]}" < "$CT_OUT/prompt.md") \
-    | tee -p "$CT_OUT/transcript.jsonl" \
-    | jq -R --unbuffered -r 'fromjson? | select(.type == "assistant") | .message.content[]?
-        | if .type == "text" then .text
-          elif .type == "tool_use" then "> \(.name) \(.input.command // .input.file_path // .input.pattern // "")"
-          else empty end'
-  status=${PIPESTATUS[0]}
-  set -e
+  : > "$CT_OUT/transcript.jsonl"
+  : > "$CT_OUT/results.jsonl"
+  echo 0 > "$CT_OUT/validate-seconds"
+  cp "$CT_OUT/prompt.md" "$CT_TMP/message.md"
+  local -a resume=()
+  while :; do
+    left=$budget
+    if [[ $attempt -gt 1 ]]; then
+      spent="$(jq -s 'map(.total_cost_usd // 0) | add' "$CT_OUT/results.jsonl")"
+      left="$(awk -v b="$budget" -v s="$spent" 'BEGIN { printf "%.2f", b - s }')"
+      awk -v l="$left" 'BEGIN { exit !(l >= 0.01) }' \
+        || ct_die "validation failed and the \$$budget budget is spent; nothing is published"
+    fi
+    echo "attempt $attempt of $((retries + 1))"
+    session="$(claude_session "${args[@]}" --max-budget-usd "$left" "${resume[@]}" < "$CT_TMP/message.md")"
+    collect_changes
+    run_validate && break
+    [[ $attempt -le $retries ]] || ct_die "validate hook $CT_VALIDATE_PATH failed after $attempt attempt(s); nothing is published"
+    [[ -n $session ]] || ct_die "validate hook $CT_VALIDATE_PATH failed, and Claude's result has no session to resume"
+    ct_warn "validate hook $CT_VALIDATE_PATH failed; resuming Claude's session with its output"
+    retry_prompt > "$CT_TMP/message.md"
+    resume=(--resume "$session")
+    attempt=$((attempt + 1))
+  done
 
-  result="$(jq -R -c 'fromjson? | select(.type == "result")' "$CT_OUT/transcript.jsonl" | tail -n1)"
-  [[ -n $result ]] || ct_die "Claude exited with status $status and produced no result"
   # Claude's final message is the report, then the handoff notes after a marker line (instructions.md)
   : > "$CT_OUT/handoff.md"
-  jq -r '.result // ""' <<< "$result" \
+  tail -n1 "$CT_OUT/results.jsonl" | jq -r '.result // ""' \
     | awk -v report="$CT_OUT/claude-report.md" -v handoff="$CT_OUT/handoff.md" '
         !h && /^[[:space:]]*<!-- handoff -->[[:space:]]*$/ { h = 1; next }
         { print > (h ? handoff : report) }'
   touch "$CT_OUT/claude-report.md"
-  # the report text is already split out above; the rest feeds the telemetry line
-  jq -c --arg auth "$auth" 'del(.result) + {ct_auth: $auth}' <<< "$result" > "$CT_OUT/claude-result.json"
-  is_error="$(jq -r '.is_error' <<< "$result")"
-  jq -r '"claude: \(.subtype), \(.num_turns) turns, $\(.total_cost_usd // "?"), \((.duration_ms // 0) / 1000 | floor)s"' <<< "$result"
-  [[ $status -eq 0 && $is_error == false ]] || ct_die "Claude failed (exit $status, is_error=$is_error)"
+  commit_subject > /dev/null || ct_die "Claude's report doesn't start with a 'Commit: <message>' line; nothing is published"
+  merge_results "$auth" > "$CT_OUT/claude-result.json"
+  echo "has_changes=$([[ -s $CT_OUT/changes.patch ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 }
 
-phase_collect() {
+# stages Claude's work and writes the patch, file list and tree that publish re-checks
+collect_changes() {
   local tree n
   check_head
   prompt_is_uploaded && rm -f "$CT_WORK/$CT_PROMPT_PATH"
@@ -286,7 +370,6 @@ phase_collect() {
     : > "$CT_OUT/changes.patch"
   fi
   echo "$tree" > "$CT_OUT/tree"
-  echo "has_changes=$([[ $n -gt 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
   echo "Claude changed $n file(s)"
   sed 's/^/  /' "$CT_OUT/files.txt"
 }
@@ -299,16 +382,12 @@ delete_snapshot() {
   fi
 }
 
-# Claude's report starts with a `Commit: <message>` line (lib/instructions.md); without one, fall
-# back to the task name
+# Claude's report starts with a `Commit: <message>` line (lib/instructions.md)
 commit_subject() {
   local line
   line="$(grep -m1 -v '^[[:space:]]*$' "$CT_OUT/claude-report.md" | tr -d '[:cntrl:]' || true)"
-  if [[ $line =~ ^[[:space:]]*Commit:[[:space:]]*(.*[^[:space:]]) ]]; then
-    printf '%s' "${BASH_REMATCH[1]:0:200}"
-  else
-    printf 'Claude task: %s' "$CT_TASK_NAME"
-  fi
+  [[ $line =~ ^[[:space:]]*Commit:[[:space:]]*(.*[^[:space:]]) ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]:0:200}"
 }
 
 # `path<TAB>note` for each bullet of the report's Files changed section (instructions.md format)
@@ -370,6 +449,7 @@ telemetry() {
     | [ "\(.duration_ms // 0 | . / 1000 | dur)"
           + (if .duration_api_ms then " (\(.duration_api_ms / 1000 | dur) API)" else "" end),
         "\(.num_turns // "?") turns",
+        (if .ct_attempts > 1 then "\(.ct_attempts) attempts" else empty end),
         "\($in | num) in"
           + (if $in > 0 then " (\(($u.cache_read_input_tokens // 0) * 100 / $in | floor)% cached)" else "" end)
           + " / \($u.output_tokens // 0 | num) out",
@@ -379,6 +459,12 @@ telemetry() {
         (if $setup != "" then "setup \($setup | tonumber | dur)" else empty end),
         (if $validate != "" then "validate \($validate | tonumber | dur)" else empty end)
       ] | join(" · ")' "$CT_OUT/claude-result.json"
+}
+
+attempts_note() {
+  local n
+  n="$(jq -r .ct_attempts "$CT_OUT/claude-result.json")"
+  [[ $n -le 1 ]] || printf ' (attempt %s)' "$n"
 }
 
 # the task's provenance, as trailers ending the commit message and a new PR's body
@@ -399,7 +485,7 @@ pr_body() {
   else
     printf 'Automated change from the Claude task runner. Review before merging; it is never auto-merged.\n\n'
   fi
-  [[ -z $CT_REQUESTER ]] || printf 'Requested by @%s.\n\n' "$CT_REQUESTER"
+  printf 'Requested by @%s.\n\n' "$CT_REQUESTER"
   cat <<EOF
 | | |
 |---|---|
@@ -407,7 +493,7 @@ pr_body() {
 | Prompt | \`$CT_PROMPT_PATH\` |
 | Snapshot | \`$CT_SNAPSHOT_SHA\` |
 | Run | $run_url |
-| Validation | \`$CT_VALIDATE_PATH\` passed |
+| Validation | \`$CT_VALIDATE_PATH\` passed$(attempts_note) |
 
 EOF
   if [[ $CT_FOLLOWUP == true ]]; then
@@ -433,15 +519,9 @@ EOF
     echo "</details>"
     echo
   fi
-  local prompt fence='```'
-  prompt="$(git show "$CT_SNAPSHOT_SHA:$CT_PROMPT_PATH" | head -c 20000)"
-  # a fence longer than any backtick run in the prompt, so the prompt can't close it early
-  while [[ $prompt == *"$fence"* ]]; do fence+='`'; done
   echo "<details><summary>Prompt</summary>"
   echo
-  echo "$fence"
-  printf '%s\n' "$prompt"
-  echo "$fence"
+  fenced "$(git show "$CT_SNAPSHOT_SHA:$CT_PROMPT_PATH" | head -c 20000)"
   echo "</details>"
   echo
   echo "### Claude's changes"
@@ -473,7 +553,7 @@ label_and_assign() {
     --description "Opened by the Claude task runner" > /dev/null 2>&1 || true
   gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --add-label "$CT_PR_LABEL" > /dev/null \
     || ct_warn "couldn't label $pr $CT_PR_LABEL"
-  [[ -z $CT_REQUESTER ]] || gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --add-assignee "$CT_REQUESTER" > /dev/null \
+  gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --add-assignee "$CT_REQUESTER" > /dev/null \
     || ct_warn "couldn't assign $pr to $CT_REQUESTER"
 }
 
@@ -516,18 +596,11 @@ phase_publish() {
   fi
 
   # the requester owns the change; the bot that pushes it is the committer
-  committer=$CT_DEFAULT_COMMITTER
-  if [[ -n ${CT_PUBLISH_APP_SLUG-} ]]; then
-    committer="$(github_identity "$CT_PUBLISH_APP_SLUG[bot]")" \
-      || { ct_warn "looking up $CT_PUBLISH_APP_SLUG[bot] failed; committing as github-actions[bot]"; committer=$CT_DEFAULT_COMMITTER; }
-  fi
-  author=$committer
-  if [[ -n $CT_REQUESTER ]]; then
-    author="$(github_identity "$CT_REQUESTER")" \
-      || { ct_warn "looking up $CT_REQUESTER failed; the bot authors the commit"; author=$committer; }
-  fi
+  committer=$CT_COMMITTER
+  author="$(github_identity "$CT_REQUESTER")" \
+    || ct_die "looking up $CT_REQUESTER failed; nothing was pushed. The patch is in this run's artifact and $CT_SNAPSHOT_REF is kept."
 
-  subject="$(commit_subject)"
+  subject="$(commit_subject)" || ct_die "Claude's report has no 'Commit: <message>' line"
   { printf '%s\n\n' "$subject"; provenance "$run_url"; } |
     GIT_AUTHOR_NAME="${author%%$'\t'*}" GIT_AUTHOR_EMAIL="${author#*$'\t'}" \
     GIT_COMMITTER_NAME="${committer%%$'\t'*}" GIT_COMMITTER_EMAIL="${committer#*$'\t'}" \
@@ -561,10 +634,9 @@ phase_publish() {
 case "${1-}" in
   inputs) phase_inputs ;;
   verify) phase_verify ;;
-  app-client) phase_app_client "${2-}" ;;
+  setup-app) phase_setup_app ;;
   hook) phase_hook "${2-}" ;;
   claude) phase_claude ;;
-  collect) phase_collect ;;
   publish) phase_publish ;;
-  *) ct_die "usage: ci.sh inputs|verify|app-client <setup|publish>|hook <setup|validate>|claude|collect|publish" ;;
+  *) ct_die "usage: ci.sh inputs|verify|setup-app|hook setup|claude|publish" ;;
 esac

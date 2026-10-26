@@ -87,13 +87,15 @@ EOF
   export SB_CLAUDE_CWD="$SB/claude-cwd" SB_CLAUDE_MSG="$SB/claude-msg" GH_MOCK_ARTIFACT="$SB/out"
 }
 
-# FAKE_CLAUDE: edit (default) | none | fail | error-result | protected | hook | secret
+# FAKE_CLAUDE: edit (default) | none | fail | error-result | protected | hook | secret | retry | break
+# retry breaks validation in the first session and fixes it once resumed; break always breaks it
 install_claude_mock() {
   cat > "$SB/bin/fake-claude" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 cat > "$PWD/../claude-stdin"
 printf '%s\n' "$@" > "$PWD/../claude-args"
+echo "$*" >> "$PWD/../claude-calls"
 {
   echo "rule=${ANTHROPIC_FEDERATION_RULE_ID-}"
   echo "org=${ANTHROPIC_ORGANIZATION_ID-}"
@@ -109,7 +111,7 @@ printf '%s\n' "$@" > "$PWD/../claude-args"
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
 result() {
   jq -nc --arg subtype "$1" --argjson is_error "$2" --arg report "${FAKE_REPORT-$DEFAULT_REPORT}" \
-    '{type: "result", subtype: $subtype, is_error: $is_error, result: $report, num_turns: 2,
+    '{type: "result", subtype: $subtype, is_error: $is_error, result: $report, num_turns: 2, session_id: "sess-1",
       total_cost_usd: 3.4, duration_ms: 872000, duration_api_ms: 725000,
       usage: {input_tokens: 1000, cache_read_input_tokens: 1900000, cache_creation_input_tokens: 99000, output_tokens: 38500},
       modelUsage: {"claude-haiku": {costUSD: 0.1}, "claude-opus": {costUSD: 3.3}}}'
@@ -137,6 +139,8 @@ case "${FAKE_CLAUDE:-edit}" in
   protected) echo x > .github/workflows/evil.yml ;;
   hook) echo 'exit 0' > .claude-task/validate.sh ;;
   secret) printf 'key=%s%s\n' AKIA ABCDEFGHIJKLMNOP > leaked.txt ;;
+  retry) if [[ " $* " == *" --resume sess-1 "* ]]; then echo fixed > a.txt; else : > a.txt; fi ;;
+  break) : > a.txt ;;
 esac
 result success false
 EOF
@@ -182,8 +186,7 @@ ci_env() {
 
 # the run job's steps in workflow order, then the publish job in a fresh checkout
 pipeline() {
-  "$CI" inputs && "$CI" verify && "$CI" hook setup && "$CI" claude && "$CI" collect \
-    && "$CI" hook validate || return 1
+  "$CI" inputs && "$CI" verify && "$CI" hook setup && "$CI" claude || return 1
   rm -rf "$SB/pub"
   git clone -q --depth 2 --branch "$CT_SNAPSHOT_REF" "file://$SB/remote.git" "$SB/pub"
   CT_WORK="$SB/pub" "$CI" inputs && CT_WORK="$SB/pub" "$CI" publish
@@ -421,42 +424,28 @@ test_ci_success_publishes_pr() {
 }
 
 test_ci_publish_identities() {
+  # a failed lookup of the requester pushes nothing
   sandbox
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  CT_PUBLISH_APP_SLUG=task-app pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
-  git fetch -q origin task-t
-  eq "$(git log -1 --format='%cn <%ce>' FETCH_HEAD)" "Task-app[bot] <1+task-app[bot]@users.noreply.github.com>" "app committer"
+  GH_MOCK_FAIL=user pipeline > "$SB/log" 2>&1 && die "published without the requester's identity"
+  contains "$(cat "$SB/log")" "looking up octo failed; nothing was pushed"
+  eq "$(git ls-remote origin refs/heads/task-t)" "" "pushed anyway"
+  [[ -n $(snap) ]] || die "snapshot removed"
 
-  # a failed lookup still publishes, as the bot
-  git push -q origin --delete task-t
-  submit tasks/t.md
   ci_env
-  GH_MOCK_FAIL=user pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
-  contains "$(cat "$SB/log")" "looking up octo failed"
-  git fetch -q origin task-t
-  eq "$(git log -1 --format=%an FETCH_HEAD)" "github-actions[bot]" "fallback author"
-
-  # dispatched without a known actor: no requester line or assignee
-  git push -q origin --delete task-t
-  : > "$GH_LOG"
-  submit tasks/t.md
-  ci_env
-  GITHUB_TRIGGERING_ACTOR= pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
-  grep -q 'Requested by' "$SB/out/pr-body.md" && die "requester line without a requester"
-  grep -q -- "--add-assignee" "$GH_LOG" && die "assigned without a requester"
-  true
+  GITHUB_TRIGGERING_ACTOR= fails "$CI" publish 2>/dev/null
 }
 
-test_ci_commit_subject_fallback() {
+test_ci_commit_line_required() {
   sandbox
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  FAKE_REPORT=$'## Summary\nno commit line' pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
-  grep -q "^pr create --repo test/repo --base main --head task-t --title Claude task: t --body-file" "$GH_LOG" || die "$(cat "$GH_LOG")"
-  grep -q '^## Summary' "$SB/out/pr-body.md" || die "PR body lacks Claude's report"
+  FAKE_REPORT=$'## Summary\nno commit line' pipeline > "$SB/log" 2>&1 && die "published without a Commit line"
+  grep -q "report doesn't start with a 'Commit: <message>' line" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(git ls-remote origin refs/heads/task-t)" "" "published anyway"
 }
 
 test_ci_claude_failure_blocks_publish() {
@@ -475,12 +464,57 @@ test_ci_claude_failure_blocks_publish() {
 
 test_ci_validation_failure_blocks_publish() {
   sandbox
+  echo 'CLAUDE_MAX_BUDGET_USD=20' >> .claude-task/config && git commit -qam budget && git push -q origin main
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  VALIDATE_EXTRA=false pipeline > "$SB/log" 2>&1 && die "pipeline passed"
-  grep -q "validate hook .claude-task/validate.sh failed" "$SB/log" || die "$(cat "$SB/log")"
+  FAKE_CLAUDE=break pipeline > "$SB/log" 2>&1 && die "pipeline passed"
+  grep -q "validate hook .claude-task/validate.sh failed after 3 attempt(s)" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(grep -c '' "$SB/claude-calls")" 3 "Claude sessions"
   eq "$(git ls-remote origin refs/heads/task-t)" ""
+  [[ -n $(snap) ]] || die "snapshot removed after failure"
+
+  ci_env
+  rm "$SB/claude-calls"
+  echo 'VALIDATE_RETRIES=0' >> "$CT_CONF"
+  FAKE_CLAUDE=break pipeline > "$SB/log" 2>&1 && die "pipeline passed"
+  grep -q "failed after 1 attempt(s)" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(grep -c '' "$SB/claude-calls")" 1 "Claude sessions without retries"
+}
+
+test_ci_validation_retry() {
+  sandbox
+  echo 'CLAUDE_MAX_BUDGET_USD=20' >> .claude-task/config && git commit -qam budget && git push -q origin main
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  printf '#!/usr/bin/env bash\necho "probe api_key=${ANTHROPIC_API_KEY-}"\n' > "$SB/bin/key-probe"
+  chmod +x "$SB/bin/key-probe"
+  FAKE_CLAUDE=retry VALIDATE_EXTRA=key-probe pipeline > "$SB/log" 2>&1 \
+    || { cat "$SB/log"; die "pipeline failed"; }
+  eq "$(grep -c '' "$SB/claude-calls")" 2 "Claude sessions"
+  grep -q -- "--max-budget-usd 20$" "$SB/claude-calls" || die "first budget: $(cat "$SB/claude-calls")"
+  grep -q -- "--max-budget-usd 16.60 --resume sess-1$" "$SB/claude-calls" || die "resume: $(cat "$SB/claude-calls")"
+  contains "$(cat "$SB/claude-stdin")" "The runner ran \`.claude-task/validate.sh\` on your changes and it failed"
+  grep -q "resuming Claude's session" "$SB/log" || die "$(cat "$SB/log")"
+  grep -qx 'probe api_key=' "$SB/out/validate.log" || die "validation sees the Anthropic key: $(cat "$SB/out/validate.log")"
+  git fetch -q origin task-t
+  eq "$(git show FETCH_HEAD:a.txt)" fixed "the fixed attempt is published"
+  local body
+  body="$(cat "$SB/out/pr-body.md")"
+  contains "$body" '| Validation | `.claude-task/validate.sh` passed (attempt 2) |'
+  grep -qE '^<sub>29m 4s \(24m 10s API\) · 4 turns · 2 attempts · 4M in \(95% cached\) / 77k out · \$6\.80 · claude-opus · ' <<< "$body" \
+    || die "telemetry: $(tail -n 1 <<< "$body")"
+}
+
+test_ci_validation_retry_budget() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  FAKE_CLAUDE=retry pipeline > "$SB/log" 2>&1 && die "pipeline passed"
+  grep -q 'validation failed and the \$1 budget is spent' "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(grep -c '' "$SB/claude-calls")" 1 "Claude sessions"
 }
 
 test_ci_validation_must_not_change_tree() {
@@ -562,7 +596,7 @@ test_ci_publish_rejects_tampered_patch() {
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  "$CI" verify && "$CI" hook setup && "$CI" claude && "$CI" collect > /dev/null 2>&1
+  "$CI" verify && "$CI" hook setup && "$CI" claude > /dev/null 2>&1
   sed -i 's/^+changed by claude$/+something else/' "$SB/out/changes.patch"
   rm -rf "$SB/pub"
   git clone -q --depth 2 --branch "$CT_SNAPSHOT_REF" "file://$SB/remote.git" "$SB/pub"
@@ -840,7 +874,9 @@ test_validate_required() {
   rm .claude-task/validate.sh
   ci_env
   git -C "$CT_WORK" rm -q --cached .claude-task/validate.sh && rm "$CT_WORK/.claude-task/validate.sh"
-  fails "$CI" hook validate 2>/dev/null
+  out="$("$CI" claude 2>&1)" && die "ran without validate.sh"
+  contains "$out" ".claude-task/validate.sh is not a regular file"
+  [[ ! -e $SB/claude-calls ]] || die "Claude ran before the missing hook was caught"
 }
 
 test_init() {
@@ -933,27 +969,21 @@ test_ci_requires_some_credential() {
   contains "$out" "or configure workload identity federation"
 }
 
-test_ci_app_client() {
+test_ci_setup_app() {
   sandbox
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  local which key out
-  for which in setup publish; do
-    key="${which^^}_GH_APP_CLIENT_ID"
-    : > "$GITHUB_OUTPUT"
-    "$CI" app-client "$which" > /dev/null
-    grep -qx client_id= "$GITHUB_OUTPUT" || die "$which client ID set without config"
-    : > "$GITHUB_OUTPUT"
-    echo "$key=Iv23li${which}1" >> "$CT_CONF"
-    "$CI" app-client "$which" > /dev/null
-    grep -qx "client_id=Iv23li${which}1" "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
-    echo "$key=x\$(id)" >> "$CT_CONF"
-    out="$("$CI" app-client "$which" 2>&1)" && die "accepted a bad $which client ID"
-    contains "$out" "unexpected characters"
-  done
-  out="$("$CI" app-client other 2>&1)" && die "accepted an unknown app"
-  contains "$out" "unknown app"
+  "$CI" setup-app > /dev/null
+  grep -qx client_id= "$GITHUB_OUTPUT" || die "client ID set without config"
+  : > "$GITHUB_OUTPUT"
+  echo 'SETUP_GH_APP_CLIENT_ID=Iv23liAbC123' >> "$CT_CONF"
+  "$CI" setup-app > /dev/null
+  grep -qx client_id=Iv23liAbC123 "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
+  local out
+  echo 'SETUP_GH_APP_CLIENT_ID=x$(id)' >> "$CT_CONF"
+  out="$("$CI" setup-app 2>&1)" && die "accepted a bad client ID"
+  contains "$out" "unexpected characters"
 }
 
 # --- runner ------------------------------------------------------------------------------------

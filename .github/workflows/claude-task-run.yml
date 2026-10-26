@@ -41,9 +41,6 @@ on:
       SETUP_ENV:
         description: Exposed as SETUP_ENV to the project's setup script only, e.g. KEY=value lines
         required: false
-      PUBLISH_GH_APP_KEY:
-        description: Private key of the GitHub App named by PUBLISH_GH_APP_CLIENT_ID in .claude-task/config
-        required: false
 
 env:
   # runner scripts come from this workflow's own commit (whatever the caller pinned) and the project
@@ -68,7 +65,7 @@ jobs:
       # only used when .claude-task/config sets up workload identity federation
       id-token: write
     outputs:
-      has_changes: ${{ steps.collect.outputs.has_changes }}
+      has_changes: ${{ steps.claude.outputs.has_changes }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,7 +98,7 @@ jobs:
 
       - name: Read setup app
         id: setup-app
-        run: '"$CT_CI" app-client setup'
+        run: '"$CT_CI" setup-app'
 
       # revoked when the job ends; reaches only the setup hook
       - name: Mint setup app token
@@ -119,18 +116,13 @@ jobs:
           SETUP_ENV: ${{ secrets.SETUP_ENV }}
         run: '"$CT_CI" hook setup'
 
-      - name: Run Claude
+      # Claude, then collect and validate.sh; a failed validation goes back to Claude's session
+      - name: Run Claude and validate
+        id: claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: '"$CT_CI" claude'
-
-      - name: Collect changes
-        id: collect
-        run: '"$CT_CI" collect'
-
-      - name: Project validation
-        run: '"$CT_CI" hook validate'
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -152,7 +144,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: claude-task-${{ inputs.task_id }}-transcript
-          path: out/transcript.jsonl
+          path: |
+            out/transcript.jsonl
+            out/validate.log
           if-no-files-found: ignore
           retention-days: 7
 
@@ -182,29 +176,12 @@ jobs:
       - name: Check inputs
         run: '"$CT_CI" inputs'
 
-      - name: Read publish app
-        id: publish-app
-        run: '"$CT_CI" app-client publish'
-
-      # pushes and PRs made with the workflow's own token don't start the repo's other workflows,
-      # so without an app the task PR gets no CI until someone else pushes to it
-      - name: Mint publish app token
-        id: publish-app-token
-        if: steps.publish-app.outputs.client_id != ''
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ steps.publish-app.outputs.client_id }}
-          private-key: ${{ secrets.PUBLISH_GH_APP_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-
       # depth 2 for the PR body's list of submitted local changes and the uploaded-prompt check
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/heads/${{ inputs.snapshot_ref }}
           path: work
           fetch-depth: 2
-          token: ${{ steps.publish-app-token.outputs.token || github.token }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -213,6 +190,5 @@ jobs:
 
       - name: Publish branch and PR
         env:
-          GH_TOKEN: ${{ steps.publish-app-token.outputs.token || github.token }}
-          CT_PUBLISH_APP_SLUG: ${{ steps.publish-app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ github.token }}
         run: '"$CT_CI" publish'

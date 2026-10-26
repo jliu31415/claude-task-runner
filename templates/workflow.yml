@@ -59,6 +59,3 @@ jobs:
       # optional: SETUP_ENV for the setup script, e.g. KEY=value lines it writes to a gitignored
       # env file the project needs at runtime
       SETUP_ENV: ${{ secrets.SETUP_ENV }}
-      # optional: a GitHub App key with PUBLISH_GH_APP_CLIENT_ID in .claude-task/config, so task
-      # PRs come from the app and start the repo's CI
-      PUBLISH_GH_APP_KEY: ${{ secrets.PUBLISH_GH_APP_KEY }}

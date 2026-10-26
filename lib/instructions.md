@@ -7,8 +7,11 @@ How to work:
 - Inspect the relevant source files, project instructions (CLAUDE.md, READMEs) and existing
   conventions before changing anything.
 - Implement what the task asks for. Avoid unrelated refactors, reformatting and drive-by changes.
-- Run the project's relevant builds and tests and fix failures your change causes. The project's
-  validation script runs after you finish, and a failure there discards your work.
+- Run the builds and tests relevant to your change and fix failures it causes. When you finish,
+  the runner runs the project's full checks (`.claude-task/validate.sh`) itself. If they fail,
+  this session gets their output to fix, a limited number of times; a failure after that discards
+  your work. Don't also run that whole script yourself as a last step; the runner's run is the
+  check.
 - Leave your changes in the working tree. Do not commit, push, create branches or open pull
   requests; the runner publishes your changes for review.
 - Do not modify CI configuration, the task runner, or the protected paths listed below.
