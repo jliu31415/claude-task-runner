@@ -64,7 +64,11 @@ case "$1 $2" in
       *) echo "123 https://github.com/test/repo/actions/runs/123" ;;
     esac ;;
   "pr create") [[ ${GH_MOCK_FAIL-} == pr ]] && exit 1; echo "https://github.com/test/repo/pull/1" ;;
-  "pr comment") exit 0 ;;
+  "pr comment"|"pr edit"|"label create") exit 0 ;;
+  "api users/"*)
+    [[ ${GH_MOCK_FAIL-} == user ]] && exit 1
+    login=${2#users/}
+    printf '%s\t%s\n' "${login^}" "1+$login@users.noreply.github.com" ;;
   "pr list")
     case "$*" in
       *headRefName*) printf '%s\n' "${GH_MOCK_OPEN_BRANCHES-}" ;;
@@ -169,7 +173,7 @@ ci_env() {
   export CT_CONF="$REPO/.claude-task/config" CT_WORK="$SB/work" CT_OUT="$SB/out"
   export CT_SNAPSHOT_REF="agent-snapshots/$TASK_ID" CT_SNAPSHOT_SHA="$SNAP_SHA"
   export CT_PROMPT_PATH="${1:-tasks/t.md}" CT_TASK_NAME="${TASK_ID%-*}" CT_TASK_ID="$TASK_ID"
-  export GITHUB_REF=refs/heads/main GITHUB_REPOSITORY=test/repo GITHUB_RUN_ID=1
+  export GITHUB_REF=refs/heads/main GITHUB_REPOSITORY=test/repo GITHUB_RUN_ID=1 GITHUB_TRIGGERING_ACTOR=octo
   export GITHUB_OUTPUT="$SB/gh-output" GITHUB_STEP_SUMMARY="$SB/summary"
   export CLAUDE_BIN=fake-claude ANTHROPIC_API_KEY=dummy
   rm -rf "$CT_WORK"
@@ -405,6 +409,44 @@ test_ci_success_publishes_pr() {
   grep -qx 'Do the thing.' "$SB/out/pr-body.md" || die "PR body lacks the prompt"
   grep -qx '````' "$SB/out/pr-body.md" || die "prompt fence not longer than its backtick runs"
   eq "$(snap)" "" "snapshot ref not cleaned up"
+
+  eq "$(git log -1 --format='%an <%ae>' "$SNAP_SHA")" "tester <tester@example.com>" "snapshot author"
+  eq "$(git log -1 --format='%an <%ae>' "$tip")" "Octo <1+octo@users.noreply.github.com>" "commit author"
+  eq "$(git log -1 --format='%cn <%ce>' "$tip")" \
+    "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>" "committer"
+  grep -qx 'Requested by @octo.' "$SB/out/pr-body.md" || die "PR body lacks the requester"
+  eq "$(tail -n 4 "$SB/out/pr-body.md")" "$(git log -1 --format='%(trailers:only,unfold)' "$tip" | head -n 4)" "PR body trailers"
+  grep -q "^pr edit https://github.com/test/repo/pull/1 --repo test/repo --add-label claude-task$" "$GH_LOG" || die "$(cat "$GH_LOG")"
+  grep -q "^pr edit https://github.com/test/repo/pull/1 --repo test/repo --add-assignee octo$" "$GH_LOG" || die "$(cat "$GH_LOG")"
+}
+
+test_ci_publish_identities() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  CT_PUBLISH_APP_SLUG=task-app pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  git fetch -q origin task-t
+  eq "$(git log -1 --format='%cn <%ce>' FETCH_HEAD)" "Task-app[bot] <1+task-app[bot]@users.noreply.github.com>" "app committer"
+
+  # a failed lookup still publishes, as the bot
+  git push -q origin --delete task-t
+  submit tasks/t.md
+  ci_env
+  GH_MOCK_FAIL=user pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  contains "$(cat "$SB/log")" "looking up octo failed"
+  git fetch -q origin task-t
+  eq "$(git log -1 --format=%an FETCH_HEAD)" "github-actions[bot]" "fallback author"
+
+  # dispatched without a known actor: no requester line or assignee
+  git push -q origin --delete task-t
+  : > "$GH_LOG"
+  submit tasks/t.md
+  ci_env
+  GITHUB_TRIGGERING_ACTOR= pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  grep -q 'Requested by' "$SB/out/pr-body.md" && die "requester line without a requester"
+  grep -q -- "--add-assignee" "$GH_LOG" && die "assigned without a requester"
+  true
 }
 
 test_ci_commit_subject_fallback() {
@@ -599,6 +641,9 @@ test_followup_submit_and_publish() {
   grep -q "^pr comment https://github.com/test/repo/pull/12 --repo test/repo --body-file" "$GH_LOG" || die "$(cat "$GH_LOG")"
   grep -q "^pr create" "$GH_LOG" && die "opened a second PR"
   contains "$(cat "$SB/out/pr-body.md")" "### Follow-up task \`$TASK_ID\`"
+  grep -qx 'Requested by @octo.' "$SB/out/pr-body.md" || die "comment lacks the requester"
+  grep -q '^Task: ' "$SB/out/pr-body.md" && die "comment repeats the trailers"
+  grep -q "^pr edit" "$GH_LOG" && die "follow-up relabelled the PR"
   eq "$(snap)" "" "snapshot not cleaned up"
 }
 
@@ -888,21 +933,27 @@ test_ci_requires_some_credential() {
   contains "$out" "or configure workload identity federation"
 }
 
-test_ci_setup_app() {
+test_ci_app_client() {
   sandbox
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  "$CI" setup-app > /dev/null
-  grep -qx client_id= "$GITHUB_OUTPUT" || die "client ID set without config"
-  : > "$GITHUB_OUTPUT"
-  echo 'SETUP_GH_APP_CLIENT_ID=Iv23liAbC123' >> "$CT_CONF"
-  "$CI" setup-app > /dev/null
-  grep -qx client_id=Iv23liAbC123 "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
-  local out
-  echo 'SETUP_GH_APP_CLIENT_ID=x$(id)' >> "$CT_CONF"
-  out="$("$CI" setup-app 2>&1)" && die "accepted a bad client ID"
-  contains "$out" "unexpected characters"
+  local which key out
+  for which in setup publish; do
+    key="${which^^}_GH_APP_CLIENT_ID"
+    : > "$GITHUB_OUTPUT"
+    "$CI" app-client "$which" > /dev/null
+    grep -qx client_id= "$GITHUB_OUTPUT" || die "$which client ID set without config"
+    : > "$GITHUB_OUTPUT"
+    echo "$key=Iv23li${which}1" >> "$CT_CONF"
+    "$CI" app-client "$which" > /dev/null
+    grep -qx "client_id=Iv23li${which}1" "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
+    echo "$key=x\$(id)" >> "$CT_CONF"
+    out="$("$CI" app-client "$which" 2>&1)" && die "accepted a bad $which client ID"
+    contains "$out" "unexpected characters"
+  done
+  out="$("$CI" app-client other 2>&1)" && die "accepted an unknown app"
+  contains "$out" "unknown app"
 }
 
 # --- runner ------------------------------------------------------------------------------------

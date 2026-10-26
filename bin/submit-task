@@ -383,8 +383,7 @@ cmd_submit() {
   fi
 
   snapshot_sha="$(printf 'Snapshot for task %s\n\nprompt: %s\n' "$task_id" "$rel" |
-    git -c user.name='Task Snapshot' -c user.email='task-snapshot@users.noreply.github.com' \
-      commit-tree "$tree" -p "$base_sha")"
+    git commit-tree "$tree" -p "$base_sha")"
 
   if ! ct_push_new_ref "$REMOTE" "$snapshot_sha" "refs/heads/$snapshot_ref"; then
     ct_die "pushing the snapshot to $REMOTE/$snapshot_ref failed (nothing was dispatched)"

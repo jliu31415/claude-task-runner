@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # CI side of the Claude task runner; each phase is one workflow step (see claude-task-run.yml).
-#   inputs | verify | setup-app | hook <setup|validate> | claude | collect | publish
+#   inputs | verify | app-client <setup|publish> | hook <setup|validate> | claude | collect | publish
 # Environment:
 #   CT_CONF   trusted .claude-task/config from the dispatched commit, not the snapshot (may be absent)
 #   CT_WORK   checkout of the submitted snapshot
 #   CT_OUT    directory for the prompt, report and patch (uploaded as the task artifact)
 #   CT_SNAPSHOT_REF CT_SNAPSHOT_SHA CT_PROMPT_PATH CT_TASK_NAME CT_TASK_ID   workflow inputs
 #   CT_FOLLOWUP     true when the task adds to an existing result branch and its open PR
+#   CT_PUBLISH_APP_SLUG  the GitHub App publish pushes and opens PRs as (empty: the workflow's token)
+#   GITHUB_TRIGGERING_ACTOR  who dispatched the task; authors Claude's commit and is assigned the PR
 set -euo pipefail
 
 CT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,10 +22,13 @@ CT_OIDC_AUDIENCE=https://api.anthropic.com
 CT_OIDC_REFRESH_SECONDS=${CT_OIDC_REFRESH_SECONDS:-120}
 # the job may hold id-token: write; untrusted code (hooks, Claude) runs without the request vars
 CT_NO_OIDC=(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN)
+CT_PR_LABEL=claude-task
+CT_DEFAULT_COMMITTER=$'github-actions[bot]\t41898282+github-actions[bot]@users.noreply.github.com'
 
 : "${CT_CONF:?}" "${CT_WORK:?}" "${CT_OUT:?}"
 : "${CT_SNAPSHOT_REF:?}" "${CT_SNAPSHOT_SHA:?}" "${CT_PROMPT_PATH:?}" "${CT_TASK_NAME:?}" "${CT_TASK_ID:?}"
 CT_FOLLOWUP=${CT_FOLLOWUP:-false}
+CT_REQUESTER=${GITHUB_TRIGGERING_ACTOR:-}
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 mkdir -p "$CT_OUT"
@@ -129,12 +134,16 @@ phase_verify() {
 }
 
 # the client ID is an identifier, not a secret; the workflow mints the token from it and the key
-phase_setup_app() {
-  local id
-  id="$(conf SETUP_GH_APP_CLIENT_ID)"
-  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "SETUP_GH_APP_CLIENT_ID in $CT_CONF_PATH has unexpected characters"
+phase_app_client() {
+  local which=$1 key id
+  case "$which" in
+    setup|publish) key="${which^^}_GH_APP_CLIENT_ID" ;;
+    *) ct_die "unknown app: $which" ;;
+  esac
+  id="$(conf "$key")"
+  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "$key in $CT_CONF_PATH has unexpected characters"
   echo "client_id=$id" >> "$GITHUB_OUTPUT"
-  [[ -z $id ]] || echo "setup gets a GitHub App token (client $id)"
+  [[ -z $id ]] || echo "$which gets a GitHub App token (client $id)"
 }
 
 phase_hook() {
@@ -372,6 +381,16 @@ telemetry() {
       ] | join(" · ")' "$CT_OUT/claude-result.json"
 }
 
+# the task's provenance, as trailers ending the commit message and a new PR's body
+provenance() {
+  printf 'Task: %s\nPrompt: %s\nSnapshot: %s\nRun: %s\n' "$CT_TASK_ID" "$CT_PROMPT_PATH" "$CT_SNAPSHOT_SHA" "$1"
+}
+
+# "name<TAB>email" for a GitHub account; the private noreply address links the commit to it
+github_identity() {
+  gh api "users/$1" --jq '"\(.name // .login)\t\(.id)+\(.login)@users.noreply.github.com"'
+}
+
 # a new task's PR body, or a follow-up's comment on the existing PR
 pr_body() {
   local run_url=$1 parent line
@@ -380,6 +399,7 @@ pr_body() {
   else
     printf 'Automated change from the Claude task runner. Review before merging; it is never auto-merged.\n\n'
   fi
+  [[ -z $CT_REQUESTER ]] || printf 'Requested by @%s.\n\n' "$CT_REQUESTER"
   cat <<EOF
 | | |
 |---|---|
@@ -441,6 +461,20 @@ EOF
   fi
   line="$(telemetry)"
   [[ -z $line ]] || printf '\n<sub>%s</sub>\n' "$line"
+  # a squash merge that takes its message from the PR description keeps these as trailers
+  [[ $CT_FOLLOWUP == true ]] || { echo; provenance "$run_url"; }
+}
+
+# best effort: the PR is already open, so a missing permission or an unassignable requester
+# only warns
+label_and_assign() {
+  local pr=$1
+  gh label create "$CT_PR_LABEL" --repo "$GITHUB_REPOSITORY" \
+    --description "Opened by the Claude task runner" > /dev/null 2>&1 || true
+  gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --add-label "$CT_PR_LABEL" > /dev/null \
+    || ct_warn "couldn't label $pr $CT_PR_LABEL"
+  [[ -z $CT_REQUESTER ]] || gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --add-assignee "$CT_REQUESTER" > /dev/null \
+    || ct_warn "couldn't assign $pr to $CT_REQUESTER"
 }
 
 # the open PR from this repo's branch; a follow-up only ever comments there
@@ -450,7 +484,7 @@ open_pr_url() {
 }
 
 phase_publish() {
-  local base prefix branch tree hits new run_url subject pr=""
+  local base prefix branch tree hits new run_url subject author committer pr=""
   check_inputs
   check_head
   cd "$CT_WORK"
@@ -481,12 +515,23 @@ phase_publish() {
     ct_die "result branch $branch already exists; not overwriting it. The patch is in this run's artifact and $CT_SNAPSHOT_REF is kept."
   fi
 
+  # the requester owns the change; the bot that pushes it is the committer
+  committer=$CT_DEFAULT_COMMITTER
+  if [[ -n ${CT_PUBLISH_APP_SLUG-} ]]; then
+    committer="$(github_identity "$CT_PUBLISH_APP_SLUG[bot]")" \
+      || { ct_warn "looking up $CT_PUBLISH_APP_SLUG[bot] failed; committing as github-actions[bot]"; committer=$CT_DEFAULT_COMMITTER; }
+  fi
+  author=$committer
+  if [[ -n $CT_REQUESTER ]]; then
+    author="$(github_identity "$CT_REQUESTER")" \
+      || { ct_warn "looking up $CT_REQUESTER failed; the bot authors the commit"; author=$committer; }
+  fi
+
   subject="$(commit_subject)"
-  printf '%s\n\nTask: %s\nPrompt: %s\nSnapshot: %s\nRun: %s\n' \
-      "$subject" "$CT_TASK_ID" "$CT_PROMPT_PATH" "$CT_SNAPSHOT_SHA" "$run_url" |
-    git -c user.name='github-actions[bot]' \
-        -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-        commit --quiet --no-verify -F -
+  { printf '%s\n\n' "$subject"; provenance "$run_url"; } |
+    GIT_AUTHOR_NAME="${author%%$'\t'*}" GIT_AUTHOR_EMAIL="${author#*$'\t'}" \
+    GIT_COMMITTER_NAME="${committer%%$'\t'*}" GIT_COMMITTER_EMAIL="${committer#*$'\t'}" \
+      git commit --quiet --no-verify -F -
   new="$(git rev-parse HEAD)"
   pr_body "$run_url" > "$CT_OUT/pr-body.md"
 
@@ -507,6 +552,7 @@ phase_publish() {
       ct_die "pushed $branch but creating the PR failed; open it by hand (gh pr create --base $base --head $branch). $CT_SNAPSHOT_REF is kept."
     fi
     echo "opened $pr"
+    label_and_assign "$pr"
   fi
   printf '### Task %s\n\nPR: %s\n' "$CT_TASK_ID" "$pr" >> "$GITHUB_STEP_SUMMARY"
   delete_snapshot
@@ -515,10 +561,10 @@ phase_publish() {
 case "${1-}" in
   inputs) phase_inputs ;;
   verify) phase_verify ;;
-  setup-app) phase_setup_app ;;
+  app-client) phase_app_client "${2-}" ;;
   hook) phase_hook "${2-}" ;;
   claude) phase_claude ;;
   collect) phase_collect ;;
   publish) phase_publish ;;
-  *) ct_die "usage: ci.sh inputs|verify|setup-app|hook <setup|validate>|claude|collect|publish" ;;
+  *) ct_die "usage: ci.sh inputs|verify|app-client <setup|publish>|hook <setup|validate>|claude|collect|publish" ;;
 esac
