@@ -969,21 +969,38 @@ test_ci_requires_some_credential() {
   contains "$out" "or configure workload identity federation"
 }
 
-test_ci_setup_app() {
+test_ci_app_client() {
   sandbox
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  "$CI" setup-app > /dev/null
-  grep -qx client_id= "$GITHUB_OUTPUT" || die "client ID set without config"
-  : > "$GITHUB_OUTPUT"
-  echo 'SETUP_GH_APP_CLIENT_ID=Iv23liAbC123' >> "$CT_CONF"
-  "$CI" setup-app > /dev/null
-  grep -qx client_id=Iv23liAbC123 "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
-  local out
-  echo 'SETUP_GH_APP_CLIENT_ID=x$(id)' >> "$CT_CONF"
-  out="$("$CI" setup-app 2>&1)" && die "accepted a bad client ID"
-  contains "$out" "unexpected characters"
+  local which key out
+  for which in setup publish; do
+    key="${which^^}_GH_APP_CLIENT_ID"
+    : > "$GITHUB_OUTPUT"
+    "$CI" app-client "$which" > /dev/null
+    grep -qx client_id= "$GITHUB_OUTPUT" || die "$which client ID set without config"
+    : > "$GITHUB_OUTPUT"
+    echo "$key=Iv23li${which}1" >> "$CT_CONF"
+    "$CI" app-client "$which" > /dev/null
+    grep -qx "client_id=Iv23li${which}1" "$GITHUB_OUTPUT" || die "$(cat "$GITHUB_OUTPUT")"
+    echo "$key=x\$(id)" >> "$CT_CONF"
+    out="$("$CI" app-client "$which" 2>&1)" && die "accepted a bad $which client ID"
+    contains "$out" "unexpected characters"
+  done
+  out="$("$CI" app-client other 2>&1)" && die "accepted an unknown app"
+  contains "$out" "unknown app"
+}
+
+test_ci_publish_app_committer() {
+  sandbox
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  CT_PUBLISH_APP_SLUG=task-app pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  git fetch -q origin task-t
+  eq "$(git log -1 --format='%cn <%ce>' FETCH_HEAD)" "Task-app[bot] <1+task-app[bot]@users.noreply.github.com>" "app committer"
+  eq "$(git log -1 --format=%an FETCH_HEAD)" "Octo" "author with an app"
 }
 
 # --- runner ------------------------------------------------------------------------------------

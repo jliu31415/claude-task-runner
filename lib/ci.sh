@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # CI side of the Claude task runner; each phase is one workflow step (see claude-task-run.yml).
-#   inputs | verify | setup-app | hook setup | claude | publish
+#   inputs | verify | app-client <setup|publish> | hook setup | claude | publish
 # Environment:
 #   CT_CONF   trusted .claude-task/config from the dispatched commit, not the snapshot (may be absent)
 #   CT_WORK   checkout of the submitted snapshot
 #   CT_OUT    directory for the prompt, report and patch (uploaded as the task artifact)
 #   CT_SNAPSHOT_REF CT_SNAPSHOT_SHA CT_PROMPT_PATH CT_TASK_NAME CT_TASK_ID   workflow inputs
 #   CT_FOLLOWUP     true when the task adds to an existing result branch and its open PR
+#   CT_PUBLISH_APP_SLUG  the GitHub App publish pushes and opens PRs as (empty: the workflow's token)
 #   GITHUB_TRIGGERING_ACTOR  who dispatched the task; authors Claude's commit and is assigned the PR
 set -euo pipefail
 
@@ -138,12 +139,16 @@ phase_verify() {
 }
 
 # the client ID is an identifier, not a secret; the workflow mints the token from it and the key
-phase_setup_app() {
-  local id
-  id="$(conf SETUP_GH_APP_CLIENT_ID)"
-  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "SETUP_GH_APP_CLIENT_ID in $CT_CONF_PATH has unexpected characters"
+phase_app_client() {
+  local which=$1 key id
+  case "$which" in
+    setup|publish) key="${which^^}_GH_APP_CLIENT_ID" ;;
+    *) ct_die "unknown app: $which" ;;
+  esac
+  id="$(conf "$key")"
+  [[ -z $id || $id =~ ^[A-Za-z0-9]+$ ]] || ct_die "$key in $CT_CONF_PATH has unexpected characters"
   echo "client_id=$id" >> "$GITHUB_OUTPUT"
-  [[ -z $id ]] || echo "setup gets a GitHub App token (client $id)"
+  [[ -z $id ]] || echo "$which gets a GitHub App token (client $id)"
 }
 
 check_hook_script() {
@@ -597,6 +602,10 @@ phase_publish() {
 
   # the requester owns the change; the bot that pushes it is the committer
   committer=$CT_COMMITTER
+  if [[ -n ${CT_PUBLISH_APP_SLUG-} ]]; then
+    committer="$(github_identity "$CT_PUBLISH_APP_SLUG[bot]")" \
+      || { ct_warn "looking up $CT_PUBLISH_APP_SLUG[bot] failed; committing as github-actions[bot]"; committer=$CT_COMMITTER; }
+  fi
   author="$(github_identity "$CT_REQUESTER")" \
     || ct_die "looking up $CT_REQUESTER failed; nothing was pushed. The patch is in this run's artifact and $CT_SNAPSHOT_REF is kept."
 
@@ -634,9 +643,9 @@ phase_publish() {
 case "${1-}" in
   inputs) phase_inputs ;;
   verify) phase_verify ;;
-  setup-app) phase_setup_app ;;
+  app-client) phase_app_client "${2-}" ;;
   hook) phase_hook "${2-}" ;;
   claude) phase_claude ;;
   publish) phase_publish ;;
-  *) ct_die "usage: ci.sh inputs|verify|setup-app|hook setup|claude|publish" ;;
+  *) ct_die "usage: ci.sh inputs|verify|app-client <setup|publish>|hook setup|claude|publish" ;;
 esac
