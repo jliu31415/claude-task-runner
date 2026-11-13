@@ -121,6 +121,12 @@ DEFAULT_REPORT='Commit: change a; add src/new
 ## Summary
 report
 
+## Design
+```mermaid
+flowchart LR
+  a --> b
+```
+
 ## Files changed
 - `a.txt`: append a | line
 - `./src/new.txt` — new file
@@ -408,6 +414,9 @@ test_ci_success_publishes_pr() {
   grep -q "$SNAP_SHA" "$SB/out/pr-body.md" || die "PR body lacks snapshot sha"
   grep -q "$TASK_ID" "$SB/out/pr-body.md" || die "PR body lacks task id"
   grep -q '^## Summary' "$SB/out/pr-body.md" || die "PR body lacks Claude's report"
+  [[ $(grep -n -m1 '^## Summary' "$SB/out/pr-body.md" | cut -d: -f1) -lt $(grep -n -m1 'Run details' "$SB/out/pr-body.md" | cut -d: -f1) ]] \
+    || die "report isn't above the run details"
+  grep -qx '```mermaid' "$SB/out/pr-body.md" || die "PR body lacks the design diagram"
   grep -q '^Commit:' "$SB/out/pr-body.md" && die "PR body keeps the Commit line"
   grep -qx 'Do the thing.' "$SB/out/pr-body.md" || die "PR body lacks the prompt"
   grep -qx '````' "$SB/out/pr-body.md" || die "prompt fence not longer than its backtick runs"

@@ -491,6 +491,16 @@ pr_body() {
     printf 'Automated change from the Claude task runner. Review before merging; it is never auto-merged.\n\n'
   fi
   printf 'Requested by @%s.\n\n' "$CT_REQUESTER"
+  report_body | head -c 20000
+  echo
+  echo "<details><summary>Claude's changes</summary>"
+  echo
+  files_table "$CT_SNAPSHOT_SHA" HEAD
+  echo
+  echo "</details>"
+  echo
+  echo "<details><summary>Run details</summary>"
+  echo
   cat <<EOF
 | | |
 |---|---|
@@ -524,18 +534,12 @@ EOF
     echo "</details>"
     echo
   fi
+  echo "</details>"
+  echo
   echo "<details><summary>Prompt</summary>"
   echo
   fenced "$(git show "$CT_SNAPSHOT_SHA:$CT_PROMPT_PATH" | head -c 20000)"
   echo "</details>"
-  echo
-  echo "### Claude's changes"
-  echo
-  files_table "$CT_SNAPSHOT_SHA" HEAD
-  echo
-  echo "### Claude's report"
-  echo
-  report_body | head -c 20000
   if [[ -s $CT_OUT/handoff.md ]]; then
     echo
     echo "<details><summary>Handoff notes</summary>"

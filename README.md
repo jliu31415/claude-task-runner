@@ -254,9 +254,13 @@ later.
 
 Other local changes in the snapshot that aren't on the base branch yet do show up in the PR. Git
 can't leave them out, because Claude's work is built on top of them. The last commit alone is
-Claude's work. The PR body lists both parts separately, along with the task ID, snapshot SHA, run
-link, the prompt and Claude's report. For a PR with only Claude's edits, push your local changes
-to the base branch before submitting.
+Claude's work. The PR body opens with Claude's report: a short summary and a design diagram.
+These sections follow it, each collapsed:
+- the per-file changes;
+- the run details: the task ID, snapshot SHA, run link and both parts of the branch;
+- the prompt;
+- the handoff notes.
+For a PR with only Claude's edits, push your local changes to the base branch before submitting.
 
 Claude's changes are shown as a table of every changed file with git's line counts and Claude's
 one-line note for it; a file without a note is flagged. Below the report come Claude's handoff

@@ -22,14 +22,25 @@ How to work:
 Finish with a short report in Markdown. Its first line is `Commit: <message>`, the commit message
 and pull request title for your change: one line in the imperative mood, as brief as you can
 make it (aim for under 72 characters); separate unrelated changes with `;`. Then these sections:
-- `## Summary`
+- `## Summary`: 3–6 bullets, one line each, saying what changed and what it means for the
+  project. Put any `Depends-on:` lines the project asks for first.
+- `## Design`: the architecture at a glance, so a reviewer gets it without reading prose.
+  - Start with a small diagram of the pieces this change adds or touches and how data flows
+    between them: modules, tables, APIs, repos. Use a ```` ```mermaid ```` flowchart with at
+    most about 12 nodes, or a short ASCII diagram in a code block.
+  - Mark which pieces are new or changed.
+  - Follow it with at most 4 one-line bullets: the key decisions, and how it scales or where it
+    stops holding.
 - `## Files changed`: exactly one bullet per changed file, formatted as
   ``- `path/from/repo/root`: what changed and why``, one line each. The runner turns it into a
   table next to each file's line counts.
-- `## Tests run`: commands and results.
-- `## Known limitations`
+- `## Tests run`: one line per command, formatted as `` `command`: result ``.
+- `## Known limitations`: at most 5 one-line bullets, most important first. Include what you
+  didn't verify.
 
-The report minus the Commit line is posted on the pull request as written.
+Write for a reader skimming the PR: short bullets, no paragraphs, no restating the diff. Detail a
+reviewer doesn't need up front goes in the handoff notes. The report minus the Commit line is
+posted on the pull request as written.
 
 After the report, write a line containing only `<!-- handoff -->`, then handoff notes for the
 developer who continues this work in a local Claude Code session. That session starts from these
