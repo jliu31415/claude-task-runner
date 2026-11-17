@@ -49,6 +49,7 @@ Optional `.claude-task/config` keys:
 | `PROTECTED_PATHS` | empty | Extra paths Claude must not change (trailing `/` = directory) |
 | `CLAUDE_MAX_BUDGET_USD` | `10` | Passed as `--max-budget-usd` |
 | `CLAUDE_MODEL` | Claude Code default | Passed as `--model` |
+| `SETUP_ATTEMPTS` | `2` | Times `setup.sh` runs before the task fails, 30s apart, doubling; it must be safe to rerun |
 | `VALIDATE_RETRIES` | `2` | Times a failed `validate.sh` goes back to Claude to fix before the task fails |
 | `VALIDATE_ARTIFACTS` | empty | Paths or globs (e.g. `frontend/test-results/`) kept from each failed `validate.sh` run, up to 50 MB, and uploaded with the transcript; symlinks aren't followed. This guards against accidental leaks only: hooks run as the runner's user |
 | `VALIDATE_PORTS` | empty | TCP ports freed (found with `ss`) before each `validate.sh` run, e.g. `8000 1420` for dev servers it starts |
@@ -215,6 +216,24 @@ keeps an existing `post-checkout` hook and says so; to chain the two, have yours
 `submit-task worktree-setup` when its first argument is the null sha, as
 `templates/post-checkout` does. Linked paths must be gitignored as files too: `/.venv`, not
 `.venv/`, which matches only directories.
+
+### Retrying flaky downloads
+
+Release and package downloads fail now and then with HTTP 5xx. The runner reruns `setup.sh` up
+to `SETUP_ATTEMPTS` times. The project's own CI can use the same backoff through the `retry`
+action, pinned like the workflow:
+
+```yaml
+- uses: jliu31415/claude-task-runner/actions/retry@<runner sha> # <version>
+  env:
+    GH_TOKEN: ${{ github.token }}  # the step's env reaches the script
+  with:
+    run: scripts/setup.sh
+    attempts: 3   # default 3
+    delay: 30     # seconds before the second attempt, doubling up to 5 minutes; default 30
+```
+
+Outside Actions, `lib/retry.sh [-n attempts] [-d delay] [-l label] -- command...` does the same.
 
 **Upgrading the runner:** `git pull` (or check out a release tag) in your runner clone. Then
 delete `.github/workflows/claude-task.yml`, rerun `submit-task init` and commit the new pin.

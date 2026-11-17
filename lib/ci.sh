@@ -24,6 +24,8 @@ CT_OIDC_REFRESH_SECONDS=${CT_OIDC_REFRESH_SECONDS:-120}
 CT_NO_OIDC=(env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN)
 # validation runs in Claude's step but needs none of its credentials
 CT_HOOK_ENV=("${CT_NO_OIDC[@]}" -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_IDENTITY_TOKEN_FILE)
+# seconds before setup's second attempt; doubles after each failure
+CT_SETUP_RETRY_DELAY=${CT_SETUP_RETRY_DELAY:-30}
 # how much of a failed validation's output goes back to Claude
 CT_VALIDATE_TAIL_LINES=200
 CT_VALIDATE_TAIL_BYTES=30000
@@ -159,16 +161,20 @@ check_hook_script() {
 }
 
 phase_hook() {
-  local which=$1 dirty start
+  local which=$1 dirty start attempts
   [[ $which == setup ]] || ct_die "unknown hook: $which"
   if [[ ! -e $CT_WORK/$CT_SETUP_PATH ]]; then
     echo "no $CT_SETUP_PATH; skipping setup"
     return
   fi
   check_hook_script "$CT_SETUP_PATH"
+  attempts="$(conf SETUP_ATTEMPTS)"
+  [[ $attempts =~ ^[1-9][0-9]*$ ]] || ct_die "SETUP_ATTEMPTS must be a positive whole number: $attempts"
   echo "running setup hook: $CT_SETUP_PATH"
   start=$SECONDS
-  (cd "$CT_WORK" && "${CT_HOOK_ENV[@]}" "./$CT_SETUP_PATH") || ct_die "setup hook $CT_SETUP_PATH failed"
+  # reruns ride out flaky downloads (HTTP 5xx); setup must be safe to rerun
+  (cd "$CT_WORK" && "$CT_LIB/retry.sh" -n "$attempts" -d "$CT_SETUP_RETRY_DELAY" -l "$CT_SETUP_PATH" -- "${CT_HOOK_ENV[@]}" "./$CT_SETUP_PATH") \
+    || ct_die "setup hook $CT_SETUP_PATH failed"
   echo $((SECONDS - start)) > "$CT_OUT/setup-seconds"
   dirty="$(git -C "$CT_WORK" status --porcelain --untracked-files=all)"
   [[ -z $dirty ]] || { echo "$dirty" >&2; ct_die "setup hook changed tracked or unignored files (above); write outputs to ignored paths"; }
