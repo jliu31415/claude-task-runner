@@ -27,6 +27,8 @@ CT_HOOK_ENV=("${CT_NO_OIDC[@]}" -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN 
 # how much of a failed validation's output goes back to Claude
 CT_VALIDATE_TAIL_LINES=200
 CT_VALIDATE_TAIL_BYTES=30000
+# VALIDATE_ARTIFACTS kept per failed attempt; copying stops at this size
+CT_ARTIFACTS_MAX_BYTES=${CT_ARTIFACTS_MAX_BYTES:-$((50 * 1024 * 1024))}
 CT_PR_LABEL=claude-task
 CT_COMMITTER=$'github-actions[bot]\t41898282+github-actions[bot]@users.noreply.github.com'
 
@@ -222,6 +224,77 @@ free_ports() {
   done
 }
 
+# repo-relative paths or globs (`**` included), so a pattern can't reach outside the checkout
+validate_artifact_patterns() {
+  local pattern
+  local -a patterns
+  read -ra patterns <<< "$(conf VALIDATE_ARTIFACTS)"
+  for pattern in "${patterns[@]}"; do
+    [[ $pattern =~ ^[A-Za-z0-9._*?-]+(/[A-Za-z0-9._*?-]+)*/?$ ]] \
+      || ct_die "VALIDATE_ARTIFACTS in $CT_CONF_PATH must list repo-relative paths or globs, got: $pattern"
+    ! git_or_parent_path "$pattern" || ct_die "VALIDATE_ARTIFACTS in $CT_CONF_PATH can't contain '.git' or '..': $pattern"
+    echo "$pattern"
+  done
+}
+
+git_or_parent_path() { [[ /$1/ == */.git/* || /$1/ == */../* ]]; }
+
+# Keeps a failed validation's log and the regular files under VALIDATE_ARTIFACTS (test reports,
+# traces) as validate-results/attempt-<n>{.log,/}, which is uploaded with the transcript. Only
+# files whose real path is inside the checkout are read, since validate.sh can plant symlinks.
+save_validate_artifacts() {
+  local dest="$CT_OUT/validate-results/attempt-$1"
+  local -a patterns
+  mkdir -p "$CT_OUT/validate-results"
+  cp "$CT_OUT/validate.log" "$dest.log"
+  mapfile -t patterns < <(validate_artifact_patterns)
+  [[ ${#patterns[@]} -gt 0 ]] || return 0
+  mkdir -p "$dest"
+  (
+    local work pattern match real rel entry size file bytes=0 cap
+    local -a files=()
+    local -A seen=()
+    work="$(realpath -e "$CT_WORK")"
+    cd "$work"
+    shopt -s nullglob globstar
+    for pattern in "${patterns[@]}"; do
+      # unquoted so the pattern globs. A match's symlinked parents are resolved here; below it,
+      # find -P neither follows nor returns symlinks
+      for match in $pattern; do
+        # $(...) strips trailing newlines, so such a name could pass for its neighbour
+        [[ $match != *$'\n'* ]] || continue
+        real="$(realpath -e -- "$match" 2>/dev/null)" || continue
+        rel=.
+        [[ $real == "$work" ]] || rel=${real#"$work"/}
+        # rel stays absolute when the match leads outside the checkout
+        if [[ $rel == /* ]] || git_or_parent_path "$match" || git_or_parent_path "$rel"; then
+          ct_warn "VALIDATE_ARTIFACTS: skipped $match, which is in .git or leads outside the checkout"
+          continue
+        fi
+        while IFS= read -r -d '' entry; do
+          size=${entry%%$'\t'*}
+          file=${entry#*$'\t'}
+          [[ $file != *$'\n'* && ! -L $file && -z ${seen[$file]-} ]] || continue
+          ! git_or_parent_path "$file" || continue
+          seen[$file]=1
+          if (( bytes + size > CT_ARTIFACTS_MAX_BYTES )); then
+            cap="$((CT_ARTIFACTS_MAX_BYTES / 1024 / 1024)) MB"
+            (( CT_ARTIFACTS_MAX_BYTES >= 1024 * 1024 )) || cap="$CT_ARTIFACTS_MAX_BYTES bytes"
+            ct_warn "VALIDATE_ARTIFACTS for attempt $1 exceed $cap; not copying ${file#./} or anything after it"
+            break 3
+          fi
+          files+=("$file")
+          bytes=$((bytes + size))
+        done < <(find -P "./$match" -type f -printf '%s\t%p\0')
+      done
+    done
+    if [[ ${#files[@]} -gt 0 ]]; then
+      printf '%s\0' "${files[@]}" | xargs -0 cp -P --parents -t "$dest" -- || ct_warn "copying some VALIDATE_ARTIFACTS failed"
+    fi
+    echo "saved ${#files[@]} file(s) from VALIDATE_ARTIFACTS for attempt $1"
+  )
+}
+
 # runs validate.sh on the collected tree, its output written to validate.log and followed live;
 # whatever it leaves running is killed. The run times add up across attempts
 run_validate() {
@@ -379,6 +452,7 @@ phase_claude() {
   [[ $budget =~ ^[0-9]+(\.[0-9]+)?$ ]] || ct_die "CLAUDE_MAX_BUDGET_USD must be a number: $budget"
   [[ $retries =~ ^[0-9]+$ ]] || ct_die "VALIDATE_RETRIES must be a whole number: $retries"
   validate_ports > /dev/null
+  validate_artifact_patterns > /dev/null
   [[ -z $(conf VALIDATE_PORTS) ]] || command -v ss > /dev/null \
     || ct_die "VALIDATE_PORTS needs ss (iproute2) on the runner to find the listeners"
   [[ -n $model ]] && args+=(--model "$model")
@@ -400,6 +474,7 @@ phase_claude() {
     session="$(claude_session "${args[@]}" --max-budget-usd "$left" "${resume[@]}" < "$CT_TMP/message.md")"
     collect_changes
     run_validate && break
+    save_validate_artifacts "$attempt"
     [[ $attempt -le $retries ]] || ct_die "validate hook $CT_VALIDATE_PATH failed after $attempt attempt(s); nothing is published"
     [[ -n $session ]] || ct_die "validate hook $CT_VALIDATE_PATH failed, and Claude's result has no session to resume"
     ct_warn "validate hook $CT_VALIDATE_PATH failed; resuming Claude's session with its output"

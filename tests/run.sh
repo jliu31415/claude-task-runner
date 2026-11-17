@@ -630,6 +630,74 @@ test_ci_port_checks() {
   [[ ! -e $SB/claude-calls ]] || die "Claude ran before the missing ss was caught"
 }
 
+test_ci_validate_artifacts_saved() {
+  sandbox
+  printf 'VALIDATE_RETRIES=1\nCLAUDE_MAX_BUDGET_USD=20\nVALIDATE_ARTIFACTS=build/results/ **/*.trace missing/ build/out/* build/proc/ .gi?/* build/nl/*\n' >> .claude-task/config
+  git commit -qam artifacts && git push -q origin main
+  mkdir -p "$SB/outside" && echo secret > "$SB/outside/secret.txt"
+  export SB
+  cat > "$SB/bin/results-probe" <<'EOF2'
+#!/usr/bin/env bash
+mkdir -p build/results/sub build/deep
+echo "attempt" >> build/results/sub/report.txt
+echo trace > build/deep/x.trace
+ln -sf /etc/hostname build/results/escape
+ln -sfn "$SB/outside" build/out
+ln -sfn /proc/self build/proc
+ln -sfn "$SB/outside" build/results/dir
+# a regular file whose name is a symlink's plus a newline
+mkdir -p build/nl
+ln -sfn /etc/hostname build/nl/evil
+echo x > build/nl/evil$'\n'
+echo "probe ran"
+exit 1
+EOF2
+  chmod +x "$SB/bin/results-probe"
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  VALIDATE_EXTRA=results-probe pipeline > "$SB/log" 2>&1 && die "pipeline passed"
+  local r="$SB/out/validate-results"
+  grep -q "saved 2 file(s) from VALIDATE_ARTIFACTS for attempt 2" "$SB/log" || die "$(cat "$SB/log")"
+  [[ -f $r/attempt-1/build/results/sub/report.txt && -f $r/attempt-2/build/deep/x.trace ]] \
+    || die "missing results: $(find "$r")"
+  [[ ! -e $r/attempt-1/build/results/escape ]] || die "followed a symlink"
+  eq "$(cd "$r" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" \
+    "./attempt-1.log ./attempt-1/build/deep/x.trace ./attempt-1/build/results/sub/report.txt ./attempt-2.log ./attempt-2/build/deep/x.trace ./attempt-2/build/results/sub/report.txt " \
+    "saved files"
+  grep -q "skipped build/out/secret.txt, which is in .git or leads outside the checkout" "$SB/log" || die "$(cat "$SB/log")"
+  grep -q "skipped .git/config" "$SB/log" || die "$(cat "$SB/log")"
+  grep -q "probe ran" "$r/attempt-1.log" || die "attempt log missing"
+
+  submit tasks/t.md u
+  ci_env
+  rm -rf "$SB/out/validate-results"
+  CT_ARTIFACTS_MAX_BYTES=10 VALIDATE_EXTRA=results-probe pipeline > "$SB/log" 2>&1 && die "pipeline passed"
+  grep -q "VALIDATE_ARTIFACTS for attempt 1 exceed 10 bytes; not copying build/deep/x.trace" "$SB/log" || die "$(cat "$SB/log")"
+  [[ -f $r/attempt-1/build/results/sub/report.txt && ! -e $r/attempt-1/build/deep ]] || die "size limit: $(find "$r")"
+
+  submit tasks/t.md
+  ci_env
+  echo 'VALIDATE_ARTIFACTS=build/../../etc' >> "$CT_CONF"
+  out="$("$CI" claude 2>&1)" && die "accepted a pattern outside the checkout"
+  contains "$out" "VALIDATE_ARTIFACTS in .claude-task/config can't contain '.git' or '..': build/../../etc"
+}
+
+test_ci_validate_artifacts_many_files() {
+  sandbox
+  printf 'VALIDATE_RETRIES=0\nVALIDATE_ARTIFACTS=build/many/\n' >> .claude-task/config
+  git commit -qam artifacts && git push -q origin main
+  printf '#!/usr/bin/env bash\nmkdir -p build/many\ncd build/many && seq 3000 | xargs touch\nexit 1\n' > "$SB/bin/many-probe"
+  chmod +x "$SB/bin/many-probe"
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  local start=$SECONDS
+  VALIDATE_EXTRA=many-probe pipeline > "$SB/log" 2>&1 && die "pipeline passed"
+  grep -q "saved 3000 file(s) from VALIDATE_ARTIFACTS for attempt 1" "$SB/log" || die "$(cat "$SB/log")"
+  (( SECONDS - start < 15 )) || die "saving 3000 files took $((SECONDS - start))s"
+}
+
 test_ci_setup_must_not_dirty_tree() {
   sandbox
   echo x > tasks/t.md
