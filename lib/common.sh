@@ -79,6 +79,27 @@ ct_conf_get() {
   if [[ $found -eq 1 && -n $val ]]; then echo "$val"; else echo "$default"; fi
 }
 
+# "path<TAB>sha" for each gitlink (submodule or nested repository) in a tree-ish
+ct_gitlinks() {
+  local entry sha
+  # -z, so unusual paths aren't C-quoted
+  while IFS= read -r -d '' entry; do
+    read -r _ _ sha <<< "${entry%%$'\t'*}"
+    printf '%s\t%s\n' "${entry#*$'\t'}" "$sha"
+  done < <(git ls-tree -r -z "$1" | grep -z '^160000 ')
+}
+
+# the gitlinks of a tree-ish that its .gitmodules doesn't declare as submodules
+ct_undeclared_gitlinks() {
+  local declared path entry
+  # -z: "key<LF>value<NUL>", since submodule names can contain spaces
+  declared="$(git config --blob "$1:.gitmodules" -z --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | while IFS= read -r -d '' entry; do printf '%s\n' "${entry#*$'\n'}"; done)"
+  while IFS=$'\t' read -r path _; do
+    grep -qxF -- "$path" <<< "$declared" || echo "$path"
+  done < <(ct_gitlinks "$1")
+}
+
 # prints each path from stdin (one per line) that falls under a space-separated protected list;
 # entries ending in / match a directory prefix, others match exactly
 ct_protected_hits() {

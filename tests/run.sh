@@ -88,7 +88,7 @@ EOF
 }
 
 # FAKE_CLAUDE: edit (default) | none | fail | error-result | protected | hook | secret | retry | break
-#   | servers
+#   | servers | submodule-edit | submodule-move
 # retry breaks validation in the first session and fixes it once resumed; break always breaks it;
 # servers leaves a child process and a detached listener on $SB_PORT running
 install_claude_mock() {
@@ -149,6 +149,8 @@ case "${FAKE_CLAUDE:-edit}" in
   secret) printf 'key=%s%s\n' AKIA ABCDEFGHIJKLMNOP > leaked.txt ;;
   retry) if [[ " $* " == *" --resume sess-1 "* ]]; then echo fixed > a.txt; else : > a.txt; fi ;;
   break) : > a.txt ;;
+  submodule-edit) echo edited > lib/lib.txt ;;
+  submodule-move) git -C lib commit -q --allow-empty -m moved ;;
   servers)
     sleep 300 > /dev/null 2>&1 &
     echo $! > "$PWD/../claude-child"
@@ -378,18 +380,96 @@ test_secrets_rejected() {
   submit tasks/t.md
 }
 
-test_submodules_and_lfs_rejected() {
+test_nested_repos_and_lfs_rejected() {
   sandbox
   echo x > tasks/t.md
   git init -q vendor/sub && git -C vendor/sub commit -q --allow-empty -m x
   local out
   out="$("$SUBMIT" --yes tasks/t.md 2>&1)" && die "nested repo accepted"
-  contains "$out" "submodules or nested git repositories"
+  contains "$out" "nested git repositories (above) that .gitmodules doesn't declare"
   rm -rf vendor
   echo '*.bin filter=lfs diff=lfs merge=lfs -text' > .gitattributes && echo x > a.bin
   out="$("$SUBMIT" --yes tasks/t.md 2>&1)" && die "lfs accepted"
   contains "$out" "Git LFS"
   eq "$(snap)" ""
+}
+
+# adds the submodule lib (cloned from $SB/lib-remote) to main and pushes it
+submodule_repo() {
+  sandbox
+  git config --global protocol.file.allow always
+  git init -q "$SB/lib-remote"
+  echo v1 > "$SB/lib-remote/lib.txt"
+  git -C "$SB/lib-remote" add -A && git -C "$SB/lib-remote" commit -qm v1
+  git submodule add -q "$SB/lib-remote" lib
+  printf '#!/usr/bin/env bash\nset -euo pipefail\ngit submodule update --init\nmkdir -p build && echo setup > build/setup.out\n${SETUP_EXTRA:-true}\n' > .claude-task/setup.sh
+  git add -A && git commit -qm "add lib" && git push -q origin main
+  git fetch -q origin
+}
+
+test_submodule_pins_checked_against_base() {
+  submodule_repo
+  echo x > tasks/t.md
+  local out base
+  base="$(git -C lib rev-parse HEAD)"
+  submit tasks/t.md a || die "pin equal to the base branch's rejected"
+
+  echo v2 > lib/lib.txt && git -C lib commit -qam v2
+  out="$("$SUBMIT" --yes tasks/t.md b 2>&1)" || die "$out"
+  contains "$out" "isn't on any of its remote branches"
+  eq "$(git ls-tree "$(sed -n 's/^snapshot: *\([0-9a-f]*\).*/\1/p' <<< "$out")" lib | awk '{ print $3 }')" \
+    "$(git -C lib rev-parse HEAD)" "snapshot pin"
+
+  echo dirty > lib/lib.txt
+  out="$("$SUBMIT" --yes tasks/t.md c 2>&1)" && die "dirty submodule accepted"
+  contains "$out" "lib: uncommitted changes"
+  git -C lib checkout -q lib.txt
+
+  git -C lib checkout -q --orphan other && git -C lib commit -qm unrelated
+  out="$("$SUBMIT" --yes tasks/t.md c 2>&1)" && die "unrelated pin accepted"
+  contains "$out" "lib: at $(git -C lib rev-parse --short=12 HEAD), which doesn't descend from ${base:0:12} on main"
+
+  git -C lib checkout -q "$base"
+  git submodule add -q "$SB/lib-remote" lib2
+  out="$("$SUBMIT" --yes tasks/t.md c 2>&1)" && die "new submodule accepted"
+  contains "$out" "lib2: not a submodule on main yet"
+}
+
+test_submodule_unusual_path_and_uninitialized() {
+  submodule_repo
+  echo x > tasks/t.md
+  local out
+  git submodule add -q "$SB/lib-remote" "sub é"
+  git commit -qm "add sub é" && git push -q origin main && git fetch -q origin
+  submit tasks/t.md a || die "a submodule path that ls-tree quotes rejected"
+
+  echo v2 > "$SB/lib-remote/lib.txt" && git -C "$SB/lib-remote" commit -qam v2
+  git update-index --cacheinfo "160000,$(git -C "$SB/lib-remote" rev-parse HEAD),lib"
+  git commit -qm "move lib" && git submodule -q deinit -f lib
+  out="$("$SUBMIT" --yes tasks/t.md b 2>&1)" && die "unchecked pin accepted"
+  contains "$out" "lib: moved to $(git -C "$SB/lib-remote" rev-parse --short=12 HEAD) but not checked out"
+  contains "$out" "run 'git submodule update --init -- lib'"
+}
+
+test_ci_submodules() {
+  submodule_repo
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  git fetch -q origin task-t
+  eq "$(git ls-tree FETCH_HEAD lib | awk '{ print $3 }')" "$(git -C lib rev-parse HEAD)" "result pin"
+  eq "$(git diff --name-only "$SNAP_SHA" FETCH_HEAD | sort | tr '\n' ' ')" "a.txt c.txt src/new.txt tasks/t.md " "result changes"
+
+  submit tasks/t.md u
+  ci_env
+  "$CI" inputs && "$CI" verify && "$CI" hook setup > "$SB/log" 2>&1 || { cat "$SB/log"; die "setup failed"; }
+  [[ -f $CT_WORK/lib/lib.txt ]] || die "setup didn't fetch the submodule"
+  out="$(FAKE_CLAUDE=submodule-edit "$CI" claude 2>&1)" && die "accepted an edit inside a submodule"
+  contains "$out" "files inside submodules (above) changed"
+  git -C "$CT_WORK/lib" checkout -q lib.txt
+  out="$(FAKE_CLAUDE=submodule-move "$CI" claude 2>&1)" && die "accepted a moved submodule"
+  contains "$out" "submodule pins changed"
 }
 
 # --- CI phases ---------------------------------------------------------------------------------

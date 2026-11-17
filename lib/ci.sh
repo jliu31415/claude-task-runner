@@ -88,9 +88,20 @@ check_head() {
     || ct_die "checked out $head, expected snapshot $CT_SNAPSHOT_SHA; was $CT_SNAPSHOT_REF moved?"
 }
 
-no_gitlinks() {
-  ! git -C "$CT_WORK" ls-tree -r "$1" | grep -q '^160000 ' \
-    || ct_die "submodules and nested git repositories aren't supported"
+# submodules are checked against the base branch at submit; here only declared ones pass
+check_gitlinks() {
+  local undeclared
+  undeclared="$(cd "$CT_WORK" && ct_undeclared_gitlinks "$1")"
+  [[ -z $undeclared ]] || { echo "$undeclared" | sed 's/^/  /' >&2; ct_die "nested git repositories that .gitmodules doesn't declare (above) aren't supported"; }
+}
+
+# the task can't move a submodule or change files inside one; the patch could carry neither
+check_submodules_unchanged() {
+  local tree=$1 changed
+  [[ $(cd "$CT_WORK" && ct_gitlinks "$tree") == "$(cd "$CT_WORK" && ct_gitlinks "$CT_SNAPSHOT_SHA")" ]] \
+    || ct_die "submodule pins changed; tasks must leave submodules at the snapshot's commits"
+  changed="$(git -C "$CT_WORK" diff --name-only --ignore-submodules=untracked)"
+  [[ -z $changed ]] || { echo "$changed" | sed 's/^/  /' >&2; ct_die "files inside submodules (above) changed; tasks can't change submodules"; }
 }
 
 worktree_tree() {
@@ -131,7 +142,7 @@ phase_verify() {
   check_head
   git -C "$CT_WORK" rev-parse --verify --quiet "$CT_SNAPSHOT_SHA^" >/dev/null \
     || ct_die "the snapshot's parent commit wasn't fetched (checkout needs fetch-depth 2)"
-  no_gitlinks HEAD
+  check_gitlinks HEAD
   snapshot_regular_file "$CT_PROMPT_PATH" || ct_die "prompt $CT_PROMPT_PATH is not a regular file in the snapshot"
   git -C "$CT_WORK" cat-file blob "HEAD:$CT_PROMPT_PATH" > "$CT_OUT/task.md"
   [[ -s $CT_OUT/task.md ]] || ct_die "prompt $CT_PROMPT_PATH is empty"
@@ -176,7 +187,8 @@ phase_hook() {
   (cd "$CT_WORK" && "$CT_LIB/retry.sh" -n "$attempts" -d "$CT_SETUP_RETRY_DELAY" -l "$CT_SETUP_PATH" -- "${CT_HOOK_ENV[@]}" "./$CT_SETUP_PATH") \
     || ct_die "setup hook $CT_SETUP_PATH failed"
   echo $((SECONDS - start)) > "$CT_OUT/setup-seconds"
-  dirty="$(git -C "$CT_WORK" status --porcelain --untracked-files=all)"
+  # build output inside a submodule it fetched is fine; changed tracked files there aren't
+  dirty="$(git -C "$CT_WORK" status --porcelain --untracked-files=all --ignore-submodules=untracked)"
   [[ -z $dirty ]] || { echo "$dirty" >&2; ct_die "setup hook changed tracked or unignored files (above); write outputs to ignored paths"; }
 }
 
@@ -508,7 +520,8 @@ collect_changes() {
   check_head
   prompt_is_uploaded && rm -f "$CT_WORK/$CT_PROMPT_PATH"
   tree="$(worktree_tree)"
-  no_gitlinks "$tree"
+  check_gitlinks "$tree"
+  check_submodules_unchanged "$tree"
   claude_changes "$tree" > "$CT_OUT/files.txt"
   check_changes "$tree"
   n="$(grep -c '' "$CT_OUT/files.txt" || true)"
