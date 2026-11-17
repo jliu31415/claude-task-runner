@@ -447,14 +447,17 @@ test_ci_publish_identities() {
   GITHUB_TRIGGERING_ACTOR= fails "$CI" publish 2>/dev/null
 }
 
-test_ci_commit_line_required() {
+test_ci_missing_commit_line_uses_default() {
   sandbox
   echo x > tasks/t.md
   submit tasks/t.md
   ci_env
-  FAKE_REPORT=$'## Summary\nno commit line' pipeline > "$SB/log" 2>&1 && die "published without a Commit line"
-  grep -q "report doesn't start with a 'Commit: <message>' line" "$SB/log" || die "$(cat "$SB/log")"
-  eq "$(git ls-remote origin refs/heads/task-t)" "" "published anyway"
+  FAKE_REPORT=$'## Summary\nno commit line' pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  grep -q "doesn't start with a 'Commit: <message>' line; publishing as 'claude task t'" "$SB/log" || die "$(cat "$SB/log")"
+  git fetch -q origin task-t
+  eq "$(git log -1 --format=%s FETCH_HEAD)" "claude task t" "fallback subject"
+  grep -q -- "--title claude task t" "$GH_LOG" || die "PR title: $(grep 'pr create' "$GH_LOG")"
+  grep -q '^## Summary' "$SB/out/pr-body.md" || die "report dropped from the PR body"
 }
 
 test_ci_claude_failure_blocks_publish() {

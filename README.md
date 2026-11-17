@@ -239,10 +239,10 @@ them are what runs, but Claude can't change them.
 
 The result branch is the snapshot plus one commit with Claude's changes. If the prompt wasn't
 already committed in `HEAD`, that commit also removes it again, so prompts never land in the PR.
-Claude writes the commit message, which is also the PR title; a report without its `Commit:`
-line fails the run. The message ends with `Task:`, `Prompt:`, `Snapshot:` and `Run:` trailers. The
-PR body ends with the same lines, so a squash merge that takes its message from the PR
-description keeps them too.
+Claude writes the commit message, which is also the PR title; if its report lacks the `Commit:`
+line, the run warns and uses `claude task <task-name>` instead. The message ends with `Task:`,
+`Prompt:`, `Snapshot:` and `Run:` trailers. The PR body ends with the same lines, so a squash
+merge that takes its message from the PR description keeps them too.
 
 Claude's commit is authored by whoever dispatched the task (`github.triggering_actor`, with their
 GitHub noreply address; if that lookup fails, nothing is pushed) and committed by
