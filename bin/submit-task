@@ -247,13 +247,45 @@ build_tree() {
   GIT_INDEX_FILE="$index" git write-tree
 }
 
-check_tree_supported() {
-  local tree=$1 gitlinks
-  gitlinks="$(git ls-tree -r "$tree" | awk '$1 == "160000" { sub(/^[^\t]*\t/, ""); print }')"
-  if [[ -n $gitlinks ]]; then
-    printf '%s\n' "$gitlinks" | sed 's/^/  /' >&2
-    ct_die "the snapshot contains submodules or nested git repositories (above), which the task runner doesn't support; remove them or add them to .gitignore"
+# Submodules are allowed when their pinned commit is the base branch's or descends from it, so the
+# CI checkout can fetch it from the submodule's remote and the task can't roll a pin back.
+check_submodules() {
+  local tree=$1 base_branch=$2 base_ref="refs/remotes/$REMOTE/$2" undeclared path sha base_sha
+  local -a bad=()
+  undeclared="$(ct_undeclared_gitlinks "$tree")"
+  if [[ -n $undeclared ]]; then
+    printf '%s\n' "$undeclared" | sed 's/^/  /' >&2
+    ct_die "the snapshot contains nested git repositories (above) that .gitmodules doesn't declare as submodules; remove them or add them to .gitignore"
   fi
+  while IFS=$'\t' read -r path sha; do
+    [[ -n $path ]] || continue
+    if [[ -e $path/.git && -n $(git -C "$path" status --porcelain --untracked-files=no) ]]; then
+      bad+=("$path: uncommitted changes, which the snapshot can't include")
+      continue
+    fi
+    git rev-parse --verify --quiet "$base_ref" >/dev/null \
+      || ct_die "$base_ref is missing; run 'git fetch $REMOTE $base_branch' (submodule pins are checked against it)"
+    base_sha="$(ct_gitlinks "$base_ref" | awk -F '\t' -v p="$path" '$1 == p { print $2 }')"
+    if [[ -z $base_sha ]]; then
+      bad+=("$path: not a submodule on $base_branch yet; add it there first")
+    elif [[ $sha != "$base_sha" && ! -e $path/.git ]]; then
+      bad+=("$path: moved to ${sha:0:12} but not checked out, so the pin can't be checked; run 'git submodule update --init -- $path'")
+    elif [[ $sha != "$base_sha" ]] \
+        && ! git -C "$path" merge-base --is-ancestor "$base_sha" "$sha" 2>/dev/null; then
+      bad+=("$path: at ${sha:0:12}, which doesn't descend from ${base_sha:0:12} on $base_branch")
+    elif [[ $sha != "$base_sha" && -z $(git -C "$path" branch -r --contains "$sha" 2>/dev/null) ]]; then
+      ct_warn "submodule $path is at ${sha:0:12}, which isn't on any of its remote branches (as of its last fetch); setup can't fetch it unless it's pushed"
+    fi
+  done < <(ct_gitlinks "$tree")
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    printf '  %s\n' "${bad[@]}" >&2
+    ct_die "submodules must be committed at $base_branch's pinned commit or one descending from it (above)"
+  fi
+}
+
+check_tree_supported() {
+  local tree=$1 base_branch=$2
+  check_submodules "$tree" "$base_branch"
   if git ls-tree -r --name-only "$tree" | git check-attr --stdin filter | grep -q ': filter: lfs$'; then
     ct_die "the snapshot contains Git LFS files, which the task runner doesn't support yet"
   fi
@@ -395,7 +427,7 @@ cmd_submit() {
 
   [[ $(git rev-parse "$tree:$rel" 2>/dev/null) == "$(git hash-object -- "$rel")" ]] \
     || ct_die "prompt $rel is missing from the snapshot or differs from the file on disk"
-  check_tree_supported "$tree"
+  check_tree_supported "$tree" "$base_branch"
 
   local hits
   if ! hits="$(ct_secret_scan "$base_sha" "$tree")"; then

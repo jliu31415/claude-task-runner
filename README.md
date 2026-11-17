@@ -217,6 +217,25 @@ keeps an existing `post-checkout` hook and says so; to chain the two, have yours
 `templates/post-checkout` does. Linked paths must be gitignored as files too: `/.venv`, not
 `.venv/`, which matches only directories.
 
+### Submodules
+
+The snapshot carries each submodule's pinned commit, not its files. `submit-task` accepts a
+submodule only when:
+- `.gitmodules` declares it;
+- its pin is the base branch's (as of your last fetch) or a commit descending from it;
+- it has no uncommitted changes, which the snapshot couldn't include.
+
+A pin that isn't on any of the submodule's remote branches only warns, since setup can't fetch
+it until it's pushed. The runner checks out no submodule contents; `setup.sh` fetches what the
+project needs:
+
+```bash
+git submodule update --init --depth 1
+```
+
+Tasks can't change submodules: an edit inside one, or a moved pin, fails the run, since the
+patch could carry neither.
+
 ### Retrying flaky downloads
 
 Release and package downloads fail now and then with HTTP 5xx. The runner reruns `setup.sh` up
@@ -365,7 +384,8 @@ the PR body.
   is ever auto-merged.
 - The secret check is a filename and pattern heuristic over added or changed files, not a
   complete scanner. Matches are reported by path only.
-- Submodules, nested repositories and Git LFS files are rejected rather than half-uploaded.
+- Nested repositories that aren't submodules, and Git LFS files, are rejected rather than
+  half-uploaded. See [Submodules](#submodules) for what's checked there.
 - Artifacts and logs are as visible as the consuming repository. On a public repo, anyone can
   read them, including Claude's transcript.
 - `submit-task` must be run from the base branch or a task's result branch. Commits on it that
