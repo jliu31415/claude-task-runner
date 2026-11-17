@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Installed by `submit-task init`: sets up each new worktree from .claude-task/config
+# (WORKTREE_LINKS) and .claude-task/worktree.sh. `git worktree add` passes the null sha as the
+# previous HEAD.
+[[ $1 == 0000000000000000000000000000000000000000 ]] || exit 0
+[[ $(git rev-parse --git-dir) != "$(git rev-parse --git-common-dir)" ]] || exit 0
+if ! command -v submit-task >/dev/null 2>&1; then
+  echo "post-checkout: submit-task isn't on PATH; run 'submit-task worktree-setup' in this worktree" >&2
+  exit 0
+fi
+exec submit-task worktree-setup

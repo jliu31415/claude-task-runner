@@ -36,12 +36,12 @@ sandbox() {
   cd "$REPO"
   git remote add origin https://github.com/test/repo.git
   mkdir -p tasks .claude-task .github/workflows
-  printf 'ignored/\n*.log\n.env\nbuild/\n' > .gitignore
+  printf '/ignored\n*.log\n.env\nbuild/\n' > .gitignore
   echo a > a.txt; echo b > b.txt; echo c > c.txt; echo keep > keep.txt
   printf '#!/bin/sh\necho hi\n' > tool.sh
   ln -s a.txt link
   echo 'name: claude task' > .github/workflows/claude-task.yml
-  printf 'PROTECTED_PATHS=guarded/\nCLAUDE_MAX_BUDGET_USD=1\n' > .claude-task/config
+  printf 'PROTECTED_PATHS=guarded/\nCLAUDE_MAX_BUDGET_USD=1\nWORKTREE_LINKS=ignored\n' > .claude-task/config
   echo 'tasks/' > .claude-task/.gitignore
   printf '#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p build && echo setup > build/setup.out\n${SETUP_EXTRA:-true}\n' > .claude-task/setup.sh
   printf '#!/usr/bin/env bash\nset -euo pipefail\ngrep -q . a.txt\n${VALIDATE_EXTRA:-true}\n' > .claude-task/validate.sh
@@ -911,8 +911,10 @@ test_continue() {
   contains "$out" "rerun with --worktree"
   eq "$(git symbolic-ref --short HEAD)" main
 
+  mkdir -p ignored && echo state > ignored/state
   out="$("$SUBMIT" --worktree continue "$id" 2>&1)" || die "$out"
   local wt="$REPO-task-t"
+  eq "$(readlink "$wt/ignored")" "$REPO/ignored" "worktree link without the hook"
   eq "$(git -C "$wt" symbolic-ref --short HEAD)" task-t
   eq "$(git -C "$wt" rev-parse HEAD)" "$(git ls-remote origin refs/heads/task-t | cut -f1)" "worktree tip"
   eq "$(cat "$wt/.claude-task/handoff/$id.md")" $'## State\nhandoff body' "handoff notes"
@@ -928,6 +930,49 @@ test_continue() {
   eq "$(git symbolic-ref --short HEAD)" task-t
   eq "$(cat "$SB_CLAUDE_CWD")" "$REPO" "claude cwd"
   [[ -s .claude-task/handoff/$id.md ]] || die "no handoff in the checkout"
+
+  # the hook skips setup when submit-task isn't on PATH, so continue has to do it
+  git checkout -q main
+  install -m755 "$HERE/../templates/post-checkout" .git/hooks/post-checkout
+  local d path=""
+  IFS=: read -ra dirs <<< "$PATH"
+  for d in "${dirs[@]}"; do [[ -x $d/submit-task ]] || path+="${path:+:}$d"; done
+  out="$(PATH=$path "$SUBMIT" --worktree continue "$id" 2>&1)" || die "$out"
+  contains "$out" "submit-task isn't on PATH"
+  eq "$(readlink "$wt/ignored")" "$REPO/ignored" "worktree link with a hook that can't run"
+}
+
+test_worktree_setup() {
+  sandbox
+  printf 'WORKTREE_LINKS=ignored/state build/ tool.sh missing\n' >> .claude-task/config
+  printf '#!/usr/bin/env bash\necho "$CT_MAIN_WORKTREE $PWD" >> "$SB_WT_LOG"\n' > .claude-task/worktree.sh
+  chmod +x .claude-task/worktree.sh
+  git add -A && git commit -qm worktrees
+  mkdir -p ignored/state build && echo s > ignored/state/s
+  export SB_WT_LOG="$SB/wt-log"
+  install -m755 "$HERE/../templates/post-checkout" .git/hooks/post-checkout
+  ln -s "$SUBMIT" "$SB/bin/submit-task"
+
+  local wt="$SB/wt" out
+  git worktree add -q -b wt "$wt" 2> "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(readlink "$wt/ignored/state")" "$REPO/ignored/state" "nested link"
+  eq "$(readlink "$wt/build")" "$REPO/build" "directory link"
+  [[ -f $wt/tool.sh && ! -L $wt/tool.sh ]] || die "replaced a tracked file"
+  contains "$(cat "$SB/log")" "missing isn't in $REPO; not linked"
+  eq "$(cat "$SB_WT_LOG")" "$REPO $wt" "worktree.sh"
+  contains "$(cat "$SB/log")" "the link build isn't gitignored"
+  eq "$(git -C "$wt" status --porcelain)" "?? build" "links not ignored"
+
+  out="$(cd "$wt" && "$SUBMIT" worktree-setup 2>&1)" || die "$out"
+  contains "$out" "kept     ignored/state"
+  git checkout -q -b other && git checkout -q main
+  eq "$(grep -c '' "$SB_WT_LOG")" 2 "hook ran on a plain checkout"
+  out="$("$SUBMIT" worktree-setup 2>&1)" && die "set up the main checkout"
+  contains "$out" "is the main checkout"
+
+  printf 'WORKTREE_LINKS=../escape\n' > "$wt/.claude-task/config"
+  out="$(cd "$wt" && "$SUBMIT" worktree-setup 2>&1)" && die "linked outside the repo"
+  contains "$out" "must list plain repo-relative paths, got: ../escape"
 }
 
 test_pick_task() {
@@ -1065,6 +1110,7 @@ test_init() {
   contains "$out" "isn't on test/runner yet"
   [[ -x .claude-task/validate.sh && -x .claude-task/setup.sh ]] || die "hook scripts not executable"
   [[ -d .claude-task/tasks && ! -e .claude-task/config ]] || die "tasks missing or config created"
+  grep -q "submit-task worktree-setup" .git/hooks/post-checkout || die "post-checkout hook not installed"
   grep -qF "uses: test/runner/.github/workflows/claude-task-run.yml@$sha # v9.9.9" .github/workflows/claude-task.yml \
     || die "$(cat .github/workflows/claude-task.yml)"
   grep -q '@[A-Z_]*@' .github/workflows/claude-task.yml && die "unfilled placeholder"
@@ -1076,6 +1122,10 @@ test_init() {
   eq "$(cat .claude-task/validate.sh)" custom "init overwrote a file"
   cp "$runner/templates/validate.sh" "$SB/v.sh"
   fails "$SB/v.sh" 2>/dev/null
+  printf '#!/bin/sh\necho mine\n' > .git/hooks/post-checkout
+  out="$("$runner/bin/submit-task" init 2>&1)"
+  contains "$out" "kept your own $target/.git/hooks/post-checkout, so new worktrees aren't set up on checkout"
+  contains "$out" "run 'submit-task worktree-setup' when \$1 is the null sha"
 }
 
 # --- workload identity federation ----------------------------------------------------------------
