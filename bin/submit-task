@@ -17,6 +17,7 @@ usage: $PROG [-y] <name | prompt.md> [task-name]   snapshot the working tree and
        $PROG logs [task-id]                       print the task's workflow run log
        $PROG continue [-w] [task-id]              check out the task's branch and resume in Claude Code
        $PROG init                                 add the runner's files to this repo
+       $PROG worktree-setup                       set up this linked worktree (links, worktree.sh)
 
   <name> is shorthand for $CT_TASKS_DIR/<name>.md. Submitting from the base branch starts a new
   task and PR; submitting from a task's result branch adds a commit to its open PR. Without a
@@ -24,6 +25,9 @@ usage: $PROG [-y] <name | prompt.md> [task-name]   snapshot the working tree and
 
   -y, --yes        don't ask for confirmation before pushing the snapshot
   -w, --worktree   continue in a new worktree next to this checkout instead of switching branches
+
+  worktree-setup links WORKTREE_LINKS from the main checkout and runs $CT_WORKTREE_SETUP_PATH;
+  the post-checkout hook that init installs runs it for every new worktree.
 EOF
   exit 2
 }
@@ -146,6 +150,7 @@ cmd_continue() {
     git checkout -q "$branch"
   elif [[ ! -e $target ]]; then
     git worktree add -q "$target" "$branch"
+    hook_sets_up_worktrees || (cd "$target" && cmd_worktree_setup) || ct_die "setting up the worktree $target failed"
   elif [[ $(git -C "$target" symbolic-ref --quiet --short HEAD 2>/dev/null) != "$branch" ]]; then
     ct_die "$target exists but isn't a checkout of $branch"
   fi
@@ -170,6 +175,50 @@ cmd_continue() {
   exec claude "You're continuing task $task_id on branch $branch${pr:+ (PR $pr)}. A Claude session in CI did \
 the work so far and left handoff notes in $rel. Read them and the latest commit (git show --stat \
 HEAD), then briefly summarize where things stand and wait for my instructions."
+}
+
+post_checkout_hook() { git rev-parse --path-format=absolute --git-path hooks/post-checkout; }
+
+# the hook init installs already runs worktree-setup on `git worktree add`; it skips setup, and
+# exits 0, when it can't find $PROG on PATH
+hook_sets_up_worktrees() {
+  local hook
+  hook="$(post_checkout_hook)"
+  [[ -x $hook ]] && grep -q "$PROG worktree-setup" "$hook" && command -v "$PROG" > /dev/null
+}
+
+# Links the gitignored state listed in WORKTREE_LINKS (dependencies, secrets) from the main
+# checkout into this linked worktree, then runs the project's worktree.sh for what can't be
+# shared by a link (installs that resolve their own path, like node_modules).
+cmd_worktree_setup() {
+  local here main common p
+  local -a links
+  here="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
+  common="$(git rev-parse --path-format=absolute --git-common-dir)"
+  [[ ${common##*/} == .git ]] || ct_die "can't find the main checkout of $common"
+  main="${common%/.git}"
+  [[ $main != "$here" ]] || ct_die "$here is the main checkout; run this in a linked worktree"
+  cd "$here"
+  read -ra links <<< "$(ct_conf_get "$here/$CT_CONF_PATH" WORKTREE_LINKS)"
+  for p in "${links[@]}"; do
+    p="${p%/}"
+    ct_valid_repo_path "$p" || ct_die "WORKTREE_LINKS in $CT_CONF_PATH must list plain repo-relative paths, got: $p"
+    if [[ ! -e $main/$p ]]; then
+      ct_warn "$p isn't in $main; not linked"
+    elif [[ -e $p || -L $p ]]; then
+      echo "  kept     $p (already exists)"
+    else
+      mkdir -p "$(dirname "$p")"
+      ln -s "$main/$p" "$p"
+      echo "  linked   $p -> $main/$p"
+      git check-ignore -q -- "$p" \
+        || ct_warn "the link $p isn't gitignored (a pattern ending in / matches only directories); ignore '/$p' instead"
+    fi
+  done
+  [[ -e $CT_WORKTREE_SETUP_PATH ]] || return 0
+  [[ -f $CT_WORKTREE_SETUP_PATH && -x $CT_WORKTREE_SETUP_PATH ]] || ct_die "$CT_WORKTREE_SETUP_PATH is not an executable file"
+  echo "running $CT_WORKTREE_SETUP_PATH"
+  CT_MAIN_WORKTREE=$main "./$CT_WORKTREE_SETUP_PATH" || ct_die "$CT_WORKTREE_SETUP_PATH failed in $here"
 }
 
 # resolves the prompt argument (relative to the caller's cwd) to a safe repo-relative path
@@ -222,7 +271,7 @@ write_new() {
 }
 
 cmd_init() {
-  local root runner runner_sha runner_version runner_slug tmp_wf
+  local root runner runner_sha runner_version runner_slug tmp_wf hook
   root="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
   cd "$root"
   runner="$(cd "$CT_LIB/.." && pwd)"
@@ -244,10 +293,16 @@ cmd_init() {
   write_new "$runner/templates/gitignore" "$CT_DIR/.gitignore"
   write_new "$tmp_wf" ".github/workflows/$CT_WORKFLOW"
   rm -f "$tmp_wf"
+  # local to this clone, not committed; rerun init in other clones to install it there
+  hook="$(post_checkout_hook)"
+  write_new "$runner/templates/post-checkout" "$hook"
+  grep -q "$PROG worktree-setup" "$hook" \
+    || ct_warn "kept your own $hook, so new worktrees aren't set up on checkout; to chain setup, have it run '$PROG worktree-setup' when \$1 is the null sha, as $runner/templates/post-checkout does"
   mkdir -p "$CT_TASKS_DIR"
   cat <<EOF
 next:
-  1. put the project's checks in $CT_VALIDATE_PATH and its dependency install in $CT_SETUP_PATH
+  1. put the project's checks in $CT_VALIDATE_PATH and its dependency install in $CT_SETUP_PATH;
+     optionally list WORKTREE_LINKS in $CT_CONF_PATH and add $CT_WORKTREE_SETUP_PATH for new worktrees
   2. commit and push to the base branch
   3. add the ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) secret, and enable
      Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"
@@ -438,6 +493,10 @@ case "${args[0]}" in
   init)
     [[ ${#args[@]} -eq 1 ]] || usage
     cmd_init
+    ;;
+  worktree-setup)
+    [[ ${#args[@]} -eq 1 ]] || usage
+    cmd_worktree_setup
     ;;
   status|logs|continue)
     [[ ${#args[@]} -le 2 ]] || usage

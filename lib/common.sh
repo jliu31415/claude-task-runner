@@ -9,6 +9,7 @@ CT_TASKS_DIR=$CT_DIR/tasks
 CT_SETUP_PATH=$CT_DIR/setup.sh
 CT_VALIDATE_PATH=$CT_DIR/validate.sh
 CT_TEMPLATE_PATH=$CT_DIR/template.md
+CT_WORKTREE_SETUP_PATH=$CT_DIR/worktree.sh
 CT_WORKFLOW=claude-task.yml
 
 # defaults for the optional .claude-task/config keys
