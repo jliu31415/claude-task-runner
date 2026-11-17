@@ -354,7 +354,8 @@ phase_claude() {
         !h && /^[[:space:]]*<!-- handoff -->[[:space:]]*$/ { h = 1; next }
         { print > (h ? handoff : report) }'
   touch "$CT_OUT/claude-report.md"
-  commit_subject > /dev/null || ct_die "Claude's report doesn't start with a 'Commit: <message>' line; nothing is published"
+  report_commit_line > /dev/null \
+    || ct_warn "Claude's report doesn't start with a 'Commit: <message>' line; publishing as '$(default_commit_subject)'"
   merge_results "$auth" > "$CT_OUT/claude-result.json"
   echo "has_changes=$([[ -s $CT_OUT/changes.patch ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 }
@@ -388,12 +389,17 @@ delete_snapshot() {
 }
 
 # Claude's report starts with a `Commit: <message>` line (lib/instructions.md)
-commit_subject() {
+report_commit_line() {
   local line
   line="$(grep -m1 -v '^[[:space:]]*$' "$CT_OUT/claude-report.md" | tr -d '[:cntrl:]' || true)"
   [[ $line =~ ^[[:space:]]*Commit:[[:space:]]*(.*[^[:space:]]) ]] || return 1
   printf '%s' "${BASH_REMATCH[1]:0:200}"
 }
+
+# a validated change is worth more than its message; a report without one still publishes
+default_commit_subject() { printf 'claude task %s' "$CT_TASK_NAME"; }
+
+commit_subject() { report_commit_line || default_commit_subject; }
 
 # `path<TAB>note` for each bullet of the report's Files changed section (instructions.md format)
 report_file_notes() {
@@ -613,7 +619,7 @@ phase_publish() {
   author="$(github_identity "$CT_REQUESTER")" \
     || ct_die "looking up $CT_REQUESTER failed; nothing was pushed. The patch is in this run's artifact and $CT_SNAPSHOT_REF is kept."
 
-  subject="$(commit_subject)" || ct_die "Claude's report has no 'Commit: <message>' line"
+  subject="$(commit_subject)"
   { printf '%s\n\n' "$subject"; provenance "$run_url"; } |
     GIT_AUTHOR_NAME="${author%%$'\t'*}" GIT_AUTHOR_EMAIL="${author#*$'\t'}" \
     GIT_COMMITTER_NAME="${committer%%$'\t'*}" GIT_COMMITTER_EMAIL="${committer#*$'\t'}" \
