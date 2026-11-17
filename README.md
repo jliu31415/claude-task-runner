@@ -48,6 +48,7 @@ Optional `.claude-task/config` keys:
 | `CLAUDE_MAX_BUDGET_USD` | `10` | Passed as `--max-budget-usd` |
 | `CLAUDE_MODEL` | Claude Code default | Passed as `--model` |
 | `VALIDATE_RETRIES` | `2` | Times a failed `validate.sh` goes back to Claude to fix before the task fails |
+| `VALIDATE_PORTS` | empty | TCP ports freed (found with `ss`) before each `validate.sh` run, e.g. `8000 1420` for dev servers it starts |
 | `ANTHROPIC_FEDERATION_RULE_ID` | none | Enables [workload identity federation](#workload-identity-federation) |
 | `ANTHROPIC_ORGANIZATION_ID` | none | Required with a federation rule |
 | `ANTHROPIC_SERVICE_ACCOUNT_ID`, `ANTHROPIC_WORKSPACE_ID` | none | Optional federation settings |
@@ -216,9 +217,13 @@ delete `.github/workflows/claude-task.yml`, rerun `submit-task init` and commit 
    - runs Claude Code (`claude -p`, `--permission-mode dontAsk` with an explicit tool list,
      project `.claude/` settings not loaded)
    - collects the diff against the snapshot, rejecting protected-path changes and likely secrets
-   - runs `validate.sh`, which must not change the collected tree. If it fails, Claude's session
-     is resumed with the end of its output, then the diff is collected and validated again, up to
-     `VALIDATE_RETRIES` times and within one `CLAUDE_MAX_BUDGET_USD` for all attempts together.
+   - runs `validate.sh`, which must not change the collected tree. Claude's session and each
+     validation run in their own process session, and whatever either leaves running is killed
+     when it ends; processes that detach from it are caught by killing the listeners on
+     `VALIDATE_PORTS` before each validation (a listener the runner can't kill fails the task).
+     If validation fails, Claude's session is resumed with the end of its output, then the diff
+     is collected and validated again, up to `VALIDATE_RETRIES` times and within one
+     `CLAUDE_MAX_BUDGET_USD` for all attempts together.
      Neither hook sees the Anthropic credential.
    - uploads the patch as an artifact
 

@@ -88,7 +88,9 @@ EOF
 }
 
 # FAKE_CLAUDE: edit (default) | none | fail | error-result | protected | hook | secret | retry | break
-# retry breaks validation in the first session and fixes it once resumed; break always breaks it
+#   | servers
+# retry breaks validation in the first session and fixes it once resumed; break always breaks it;
+# servers leaves a child process and a detached listener on $SB_PORT running
 install_claude_mock() {
   cat > "$SB/bin/fake-claude" <<'EOF'
 #!/usr/bin/env bash
@@ -147,6 +149,11 @@ case "${FAKE_CLAUDE:-edit}" in
   secret) printf 'key=%s%s\n' AKIA ABCDEFGHIJKLMNOP > leaked.txt ;;
   retry) if [[ " $* " == *" --resume sess-1 "* ]]; then echo fixed > a.txt; else : > a.txt; fi ;;
   break) : > a.txt ;;
+  servers)
+    sleep 300 > /dev/null 2>&1 &
+    echo $! > "$PWD/../claude-child"
+    setsid python3 -m http.server --bind 127.0.0.1 "$SB_PORT" > /dev/null 2>&1 &
+    for _ in $(seq 50); do ss -Hltn "sport = :$SB_PORT" | grep -q . && break; sleep 0.1; done ;;
 esac
 result success false
 EOF
@@ -536,6 +543,91 @@ test_ci_validation_must_not_change_tree() {
   ci_env
   VALIDATE_EXTRA="touch stray.txt" pipeline > "$SB/log" 2>&1 && die "pipeline passed"
   grep -q "validation changed tracked or unignored files" "$SB/log" || die "$(cat "$SB/log")"
+}
+
+free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+
+test_ci_stray_processes_killed() {
+  sandbox
+  export SB_PORT
+  SB_PORT="$(free_port)"
+  echo "VALIDATE_PORTS=$SB_PORT" >> .claude-task/config && git commit -qam ports && git push -q origin main
+  # validate.sh fails if Claude's leftovers survive, and leaves a process holding its output
+  cat > "$SB/bin/stray-probe" <<'EOF2'
+#!/usr/bin/env bash
+! ss -Hltn "sport = :$SB_PORT" | grep -q . || { echo "port $SB_PORT still taken"; exit 1; }
+! kill -0 "$(cat "$SB/claude-child")" 2>/dev/null || { echo "claude's child survived"; exit 1; }
+sleep 300 &
+echo $! > "$SB/validate-child"
+EOF2
+  chmod +x "$SB/bin/stray-probe"
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  FAKE_CLAUDE=servers VALIDATE_EXTRA=stray-probe CI=$CI SB=$SB \
+    timeout 60 bash -c "$(declare -f pipeline); pipeline" \
+    > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  grep -q "port $SB_PORT is in use; killing" "$SB/log" || die "$(cat "$SB/log")"
+  ! kill -0 "$(cat "$SB/validate-child")" 2>/dev/null || die "validate's child survived"
+
+  submit tasks/t.md
+  ci_env
+  echo 'VALIDATE_PORTS=80 http' >> "$CT_CONF"
+  out="$("$CI" claude 2>&1)" && die "accepted a bad port"
+  contains "$out" "VALIDATE_PORTS in .claude-task/config must list TCP port numbers, got: http"
+}
+
+# ss reports a listener on every port: with $SS_MOCK_PID as its pid, else without one
+install_ss_mock() {
+  cat > "$SB/bin/ss" <<'EOF2'
+#!/usr/bin/env bash
+printf 'LISTEN 0 4096 127.0.0.1:9 0.0.0.0:*%s\n' "${SS_MOCK_PID:+ users:((\"sleep\",pid=$SS_MOCK_PID,fd=3))}"
+EOF2
+  chmod +x "$SB/bin/ss"
+}
+
+test_ci_port_checks() {
+  sandbox
+  local out port
+  port="$(free_port)"
+  echo "VALIDATE_PORTS=$port" >> .claude-task/config && git commit -qam ports && git push -q origin main
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed with nothing listening"; }
+
+  submit tasks/t.md u
+  ci_env
+  install_ss_mock
+  out="$(pipeline 2>&1)" && die "passed with an unkillable listener"
+  contains "$out" "port $port is in use by a process the runner can't see or kill"
+
+  submit tasks/t.md v
+  ci_env
+  sleep 300 &
+  export SS_MOCK_PID=$!
+  out="$(pipeline 2>&1)" && die "passed with a listener that stays"
+  contains "$out" "port $port is still in use 5s after killing pid(s) $SS_MOCK_PID"
+  { wait "$SS_MOCK_PID"; } 2>/dev/null && die "listener not killed"
+  unset SS_MOCK_PID
+  rm "$SB/bin/ss"
+
+  # every command on PATH but ss
+  local dir f
+  mkdir "$SB/no-ss"
+  IFS=: read -ra dirs <<< "$PATH"
+  for dir in "${dirs[@]}"; do
+    for f in "$dir"/*; do
+      [[ -x $f && ${f##*/} != ss && ! -e $SB/no-ss/${f##*/} ]] && ln -s "$f" "$SB/no-ss/${f##*/}"
+    done
+  done
+  submit tasks/t.md w
+  ci_env
+  "$CI" inputs && "$CI" verify && "$CI" hook setup > "$SB/log" 2>&1 || { cat "$SB/log"; die "setup failed"; }
+  rm -f "$SB/claude-calls"
+  out="$(PATH="$SB/no-ss" "$CI" claude 2>&1)" && die "ran without ss"
+  contains "$out" "VALIDATE_PORTS needs ss (iproute2) on the runner"
+  [[ ! -e $SB/claude-calls ]] || die "Claude ran before the missing ss was caught"
 }
 
 test_ci_setup_must_not_dirty_tree() {

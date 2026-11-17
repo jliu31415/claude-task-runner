@@ -172,16 +172,73 @@ phase_hook() {
   [[ -z $dirty ]] || { echo "$dirty" >&2; ct_die "setup hook changed tracked or unignored files (above); write outputs to ignored paths"; }
 }
 
-# runs validate.sh on the collected tree, its output teed to validate.log; the run times add up
-# across attempts
+# Runs "$@" as the leader of a new session and writes its session ID to $1, so kill_session can
+# stop whatever it leaves running (background servers, watchers) before the next step.
+in_session() {
+  local sidfile=$1
+  shift
+  setsid -w bash -c 'echo $$ > "$0"; exec "$@"' "$sidfile" "$@"
+}
+
+kill_session() {
+  local sid
+  sid="$(cat "$1" 2>/dev/null)" || return 0
+  rm -f "$1"
+  [[ $sid =~ ^[0-9]+$ ]] || return 0
+  pkill -TERM -s "$sid" 2>/dev/null || return 0
+  sleep 1
+  pkill -KILL -s "$sid" 2>/dev/null || true
+}
+
+validate_ports() {
+  local port
+  local -a ports
+  read -ra ports <<< "$(conf VALIDATE_PORTS)"
+  for port in "${ports[@]}"; do
+    [[ $port =~ ^[0-9]+$ ]] && (( port > 0 && port < 65536 )) \
+      || ct_die "VALIDATE_PORTS in $CT_CONF_PATH must list TCP port numbers, got: $port"
+    echo "$port"
+  done
+}
+
+# kills the listeners on VALIDATE_PORTS, e.g. a dev server Claude started that would otherwise
+# collide with the one validate.sh starts
+free_ports() {
+  local port listeners pids
+  for port in $(validate_ports); do
+    listeners="$(ss -Hltnp "sport = :$port")" || ct_die "ss couldn't list the listeners on port $port"
+    [[ -n $listeners ]] || continue
+    pids="$(grep -o 'pid=[0-9]*' <<< "$listeners" | cut -d= -f2 | sort -u | tr '\n' ' ' || true)"
+    # ss shows no pid for another user's process, which the runner couldn't kill anyway
+    [[ -n ${pids// } ]] \
+      || ct_die "port $port is in use by a process the runner can't see or kill (another user's?):"$'\n'"$listeners"
+    ct_warn "port $port is in use; killing pid(s) ${pids% }"
+    kill -KILL $pids 2>/dev/null || true
+    for _ in $(seq 50); do
+      [[ -n $(ss -Hltn "sport = :$port") ]] || continue 2
+      sleep 0.1
+    done
+    ct_die "port $port is still in use 5s after killing pid(s) ${pids% }"
+  done
+}
+
+# runs validate.sh on the collected tree, its output written to validate.log and followed live;
+# whatever it leaves running is killed. The run times add up across attempts
 run_validate() {
-  local start status total
+  local start status=0 total pid tailer
+  free_ports
   echo "running validate hook: $CT_VALIDATE_PATH"
   start=$SECONDS
-  set +e
-  (cd "$CT_WORK" && "${CT_HOOK_ENV[@]}" "./$CT_VALIDATE_PATH") 2>&1 | tee "$CT_OUT/validate.log"
-  status=${PIPESTATUS[0]}
-  set -e
+  : > "$CT_OUT/validate.log"
+  # a file rather than a pipe, so a leftover process holding the output can't stall the run
+  (cd "$CT_WORK" && in_session "$CT_TMP/validate.sid" "${CT_HOOK_ENV[@]}" "./$CT_VALIDATE_PATH") \
+    > "$CT_OUT/validate.log" 2>&1 &
+  pid=$!
+  tail -n +1 -f -s 0.2 --pid="$pid" "$CT_OUT/validate.log" &
+  tailer=$!
+  wait "$pid" || status=$?
+  wait "$tailer" || true
+  kill_session "$CT_TMP/validate.sid"
   total=$(( $(cat "$CT_OUT/validate-seconds") + SECONDS - start ))
   echo "$total" > "$CT_OUT/validate-seconds"
   [[ $(worktree_tree) == "$(cat "$CT_OUT/tree")" ]] \
@@ -237,7 +294,7 @@ claude_session() {
   local status result is_error seen
   seen="$(grep -c '' "$CT_OUT/transcript.jsonl" || true)"
   set +e
-  (cd "$CT_WORK" && "${CT_NO_OIDC[@]}" "$CT_CLAUDE_BIN" "$@") \
+  (cd "$CT_WORK" && in_session "$CT_TMP/claude.sid" "${CT_NO_OIDC[@]}" "$CT_CLAUDE_BIN" "$@") \
     | tee -a -p "$CT_OUT/transcript.jsonl" \
     | jq -R --unbuffered -r 'fromjson? | select(.type == "assistant") | .message.content[]?
         | if .type == "text" then .text
@@ -245,6 +302,7 @@ claude_session() {
           else empty end' >&2
   status=${PIPESTATUS[0]}
   set -e
+  kill_session "$CT_TMP/claude.sid"
 
   result="$(tail -n "+$((seen + 1))" "$CT_OUT/transcript.jsonl" | jq -R -c 'fromjson? | select(.type == "result")' | tail -n1)"
   [[ -n $result ]] || ct_die "Claude exited with status $status and produced no result"
@@ -320,6 +378,9 @@ phase_claude() {
   retries="$(conf VALIDATE_RETRIES)"
   [[ $budget =~ ^[0-9]+(\.[0-9]+)?$ ]] || ct_die "CLAUDE_MAX_BUDGET_USD must be a number: $budget"
   [[ $retries =~ ^[0-9]+$ ]] || ct_die "VALIDATE_RETRIES must be a whole number: $retries"
+  validate_ports > /dev/null
+  [[ -z $(conf VALIDATE_PORTS) ]] || command -v ss > /dev/null \
+    || ct_die "VALIDATE_PORTS needs ss (iproute2) on the runner to find the listeners"
   [[ -n $model ]] && args+=(--model "$model")
 
   : > "$CT_OUT/transcript.jsonl"
