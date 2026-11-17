@@ -698,6 +698,72 @@ test_ci_validate_artifacts_many_files() {
   (( SECONDS - start < 15 )) || die "saving 3000 files took $((SECONDS - start))s"
 }
 
+# fails (exit 7) its first $FLAKY_FAILS runs, counted in $SB/flaky-count
+install_flaky() {
+  cat > "$SB/bin/flaky" <<'EOF2'
+#!/usr/bin/env bash
+n=$(( $(cat "$SB/flaky-count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$SB/flaky-count"
+[[ $n -gt ${FLAKY_FAILS:-0} ]] || { echo "HTTP 504"; exit 7; }
+EOF2
+  chmod +x "$SB/bin/flaky"
+  export SB
+}
+
+test_retry_helper() {
+  sandbox
+  install_flaky
+  local out
+  out="$(FLAKY_FAILS=2 "$LIB/retry.sh" -n 3 -d 0 -- flaky 2>&1)" || die "$out"
+  contains "$out" "retry: flaky failed (exit 7); attempt 3 of 3 in 0s"
+  eq "$(cat "$SB/flaky-count")" 3 "runs"
+  rm "$SB/flaky-count"
+  out="$(FLAKY_FAILS=5 "$LIB/retry.sh" -n 2 -d 0 flaky 2>&1)" && die "succeeded"
+  contains "$out" "retry: flaky failed (exit 7) after 2 attempt(s)"
+  FLAKY_FAILS=5 "$LIB/retry.sh" -n 1 -d 0 flaky > /dev/null 2>&1 || eq "$?" 7 "exit status"
+  fails "$LIB/retry.sh" -n 0 true 2>/dev/null
+  out="$("$LIB/retry.sh" true -n 2>&1)" || die "$out"
+  out="$("$LIB/retry.sh" -n 2>&1)" && die "accepted -n without a value"
+  contains "$out" "retry: -n needs a value"
+  out="$("$LIB/retry.sh" -n 2 -d 2>&1)" && die "accepted -d without a value"
+  contains "$out" "retry: -d needs a value"
+  out="$("$LIB/retry.sh" -d 08 true 2>&1)" && die "accepted a delay with a leading zero"
+  contains "$out" "retry: delay must be a whole number of seconds: 08"
+  # the action's step script, labelled with the first non-blank line of its run input
+  sed -n '/^      run: |$/,$p' "$HERE/../actions/retry/action.yml" | tail -n +2 > "$SB/action.sh"
+  out="$(GITHUB_ACTION_PATH="$HERE/../actions/retry" CT_RETRY_ATTEMPTS=1 CT_RETRY_DELAY=0 \
+    CT_RETRY_RUN=$'\n  \n  FLAKY_FAILS=5 flaky\ntrue' bash -e "$SB/action.sh" 2>&1)" && die "action succeeded"
+  contains "$out" "retry: FLAKY_FAILS=5 flaky failed (exit 7) after 1 attempt(s)"
+
+  # the whole command, or the label, is logged; delays double up to 300s
+  printf '#!/bin/sh\necho "$1" >> "$SB/sleeps"\n' > "$SB/bin/sleep" && chmod +x "$SB/bin/sleep"
+  rm "$SB/flaky-count"
+  out="$(FLAKY_FAILS=5 "$LIB/retry.sh" -n 2 -d 0 env A=1 flaky 2>&1)" && die "succeeded"
+  contains "$out" "retry: env A=1 flaky failed (exit 7); attempt 2 of 2"
+  rm "$SB/flaky-count" "$SB/sleeps"
+  out="$(FLAKY_FAILS=5 "$LIB/retry.sh" -n 4 -d 200 -l setup.sh -- env A=1 flaky 2>&1)" && die "succeeded"
+  contains "$out" "retry: setup.sh failed (exit 7) after 4 attempt(s)"
+  eq "$(tr '\n' ' ' < "$SB/sleeps")" "200 300 300 " "delays"
+}
+
+test_ci_setup_retried() {
+  sandbox
+  install_flaky
+  echo x > tasks/t.md
+  submit tasks/t.md
+  ci_env
+  export CT_SETUP_RETRY_DELAY=0
+  FLAKY_FAILS=1 SETUP_EXTRA=flaky pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  grep -q "retry: .claude-task/setup.sh failed (exit 7); attempt 2 of 2" "$SB/log" || die "$(cat "$SB/log")"
+
+  submit tasks/t.md u
+  ci_env
+  rm "$SB/flaky-count"
+  echo 'SETUP_ATTEMPTS=1' >> "$CT_CONF"
+  FLAKY_FAILS=1 SETUP_EXTRA=flaky "$CI" hook setup > "$SB/log" 2>&1 && die "setup passed"
+  grep -q "setup hook .claude-task/setup.sh failed" "$SB/log" || die "$(cat "$SB/log")"
+}
+
 test_ci_setup_must_not_dirty_tree() {
   sandbox
   echo x > tasks/t.md

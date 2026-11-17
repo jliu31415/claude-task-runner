@@ -17,6 +17,7 @@ CT_DEFAULT_BASE_BRANCH=main
 CT_DEFAULT_RESULT_BRANCH_PREFIX=task-
 CT_DEFAULT_CLAUDE_MAX_BUDGET_USD=10
 CT_DEFAULT_VALIDATE_RETRIES=2
+CT_DEFAULT_SETUP_ATTEMPTS=2
 
 ct_die() { echo "claude-task: $*" >&2; exit 1; }
 ct_warn() { echo "claude-task: warning: $*" >&2; }

@@ -1,0 +1,33 @@
+name: retry
+description: >-
+  Runs a bash script until it succeeds, with exponential backoff between attempts, for steps
+  whose downloads fail transiently (HTTP 5xx). The script must be safe to rerun. The step's env
+  reaches the script.
+inputs:
+  run:
+    description: Bash script to run, as in a run step (bash -eo pipefail)
+    required: true
+  attempts:
+    description: Total attempts
+    required: false
+    default: "3"
+  delay:
+    description: Seconds before the second attempt; doubles after each failure
+    required: false
+    default: "30"
+  working-directory:
+    description: Directory the script runs in
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CT_RETRY_RUN: ${{ inputs.run }}
+        CT_RETRY_ATTEMPTS: ${{ inputs.attempts }}
+        CT_RETRY_DELAY: ${{ inputs.delay }}
+      run: |
+        "$GITHUB_ACTION_PATH/../../lib/retry.sh" -n "$CT_RETRY_ATTEMPTS" -d "$CT_RETRY_DELAY" \
+          -l "$(sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q}' <<< "$CT_RETRY_RUN")" -- bash -eo pipefail -c "$CT_RETRY_RUN"
