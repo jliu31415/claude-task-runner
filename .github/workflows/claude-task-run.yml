@@ -150,6 +150,7 @@ jobs:
           path: |
             out/transcript.jsonl
             out/validate.log
+            out/validate-results/
           if-no-files-found: ignore
           retention-days: 7
 

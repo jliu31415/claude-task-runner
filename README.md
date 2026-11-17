@@ -48,6 +48,7 @@ Optional `.claude-task/config` keys:
 | `CLAUDE_MAX_BUDGET_USD` | `10` | Passed as `--max-budget-usd` |
 | `CLAUDE_MODEL` | Claude Code default | Passed as `--model` |
 | `VALIDATE_RETRIES` | `2` | Times a failed `validate.sh` goes back to Claude to fix before the task fails |
+| `VALIDATE_ARTIFACTS` | empty | Paths or globs (e.g. `frontend/test-results/`) kept from each failed `validate.sh` run, up to 50 MB, and uploaded with the transcript; symlinks aren't followed. This guards against accidental leaks only: hooks run as the runner's user |
 | `VALIDATE_PORTS` | empty | TCP ports freed (found with `ss`) before each `validate.sh` run, e.g. `8000 1420` for dev servers it starts |
 | `ANTHROPIC_FEDERATION_RULE_ID` | none | Enables [workload identity federation](#workload-identity-federation) |
 | `ANTHROPIC_ORGANIZATION_ID` | none | Required with a federation rule |
@@ -293,7 +294,8 @@ the PR body.
 - **Dispatch failed after the push:** the snapshot branch is kept, and `submit-task` prints the
   exact `gh workflow run ...` command to retry, plus a command to delete the branch.
 - **The run failed:** the snapshot branch is kept. Re-run the workflow from the Actions page. The
-  transcript and the last validation output are uploaded as artifact
+  transcript, the last validation output and, under `validate-results/`, each failed
+  validation's log and `VALIDATE_ARTIFACTS` files are uploaded as artifact
   `claude-task-<id>-transcript`.
 - **The result branch already exists:** publish fails without touching it. The patch is in
   artifact `claude-task-<id>`; apply it with `git apply --index changes.patch` on a checkout of
