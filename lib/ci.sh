@@ -579,6 +579,14 @@ report_body() {
     !skip' "$CT_OUT/claude-report.md"
 }
 
+# the report's Summary section without its Depends-on lines: the commit message body
+report_summary() {
+  awk '
+    /^#+[[:space:]]/ { in_summary = ($0 ~ /^#+[[:space:]]*Summary[[:space:]]*$/); next }
+    in_summary && !/^[[:space:]]*Depends-on:/' "$CT_OUT/claude-report.md" |
+    sed '/./,$!d'
+}
+
 md_cell() { local s=${1//|/\\|}; printf '%s' "${s//$'\n'/ }"; }
 
 # git's per-file line counts joined with Claude's note for each file; a missing note is flagged
@@ -734,7 +742,7 @@ open_pr_url() {
 }
 
 phase_publish() {
-  local base prefix branch tree hits new run_url subject author committer pr=""
+  local base prefix branch tree hits new run_url subject summary author committer pr=""
   check_inputs
   check_head
   cd "$CT_WORK"
@@ -775,7 +783,8 @@ phase_publish() {
     || ct_die "looking up $CT_REQUESTER failed; nothing was pushed. The patch is in this run's artifact and $CT_SNAPSHOT_REF is kept."
 
   subject="$(commit_subject)"
-  { printf '%s\n\n' "$subject"; provenance "$run_url"; } |
+  summary="$(report_summary | head -c 4000)"
+  { printf '%s\n\n' "$subject"; [[ -z $summary ]] || printf '%s\n\n' "$summary"; provenance "$run_url"; } |
     GIT_AUTHOR_NAME="${author%%$'\t'*}" GIT_AUTHOR_EMAIL="${author#*$'\t'}" \
     GIT_COMMITTER_NAME="${committer%%$'\t'*}" GIT_COMMITTER_EMAIL="${committer#*$'\t'}" \
       git commit --quiet --no-verify -F -

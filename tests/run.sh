@@ -121,6 +121,7 @@ result() {
 DEFAULT_REPORT='Commit: change a; add src/new
 
 ## Summary
+Depends-on: test/other#1
 report
 
 ## Design
@@ -498,6 +499,7 @@ test_ci_success_publishes_pr() {
   grep -q "^pr create --repo test/repo --base main --head task-t --title change a; add src/new --body-file" "$GH_LOG" || die "$(cat "$GH_LOG")"
   eq "$(git log -1 --format=%s "$tip")" "change a; add src/new" "commit subject"
   grep -q "^Task: $TASK_ID\$" <<< "$(git log -1 --format=%b "$tip")" || die "commit body lacks task id"
+  eq "$(git log -1 --format=%b "$tip" | head -1)" "report" "commit body opens with the summary"
   grep -q "$SNAP_SHA" "$SB/out/pr-body.md" || die "PR body lacks snapshot sha"
   grep -q "$TASK_ID" "$SB/out/pr-body.md" || die "PR body lacks task id"
   grep -q '^## Summary' "$SB/out/pr-body.md" || die "PR body lacks Claude's report"
