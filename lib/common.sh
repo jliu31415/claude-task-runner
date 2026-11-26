@@ -5,6 +5,8 @@
 CT_SNAPSHOT_PREFIX=agent-snapshots/
 CT_DIR=.claude-task
 CT_CONF_PATH=$CT_DIR/config
+# gitignored, machine-local keys that only submit-task reads (CI never sees it)
+CT_CONF_LOCAL_PATH=$CT_DIR/config.local
 CT_TASKS_DIR=$CT_DIR/tasks
 CT_SETUP_PATH=$CT_DIR/setup.sh
 CT_VALIDATE_PATH=$CT_DIR/validate.sh

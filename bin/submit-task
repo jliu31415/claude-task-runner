@@ -200,6 +200,8 @@ cmd_worktree_setup() {
   [[ $main != "$here" ]] || ct_die "$here is the main checkout; run this in a linked worktree"
   cd "$here"
   read -ra links <<< "$(ct_conf_get "$here/$CT_CONF_PATH" WORKTREE_LINKS)"
+  # gitignored, so a fresh worktree lacks it otherwise
+  [[ ! -e $main/$CT_CONF_LOCAL_PATH ]] || links+=("$CT_CONF_LOCAL_PATH")
   for p in "${links[@]}"; do
     p="${p%/}"
     ct_valid_repo_path "$p" || ct_die "WORKTREE_LINKS in $CT_CONF_PATH must list plain repo-relative paths, got: $p"
@@ -237,20 +239,47 @@ resolve_prompt() {
   echo "$rel"
 }
 
-# SHARED_RULES names a file outside the repo, relative to its root, that the snapshot carries at
-# CT_SHARED_RULES_PATH for CI to put before the prompt; prints its absolute path
-resolve_shared_rules() {
-  local p=$1 root=$2 abs
-  [[ $p =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
-    || ct_die "SHARED_RULES in $CT_CONF_PATH must be a path relative to the repo root ([A-Za-z0-9._-] segments), got: $p"
-  [[ -e $root/$p ]] || ct_die "SHARED_RULES file not found: $p (from $root)"
-  abs="$(realpath -e -- "$root/$p")"
-  [[ $abs == "$(realpath -s -- "$root/$p")" ]] || ct_die "SHARED_RULES path must not contain a symlink: $p"
+# SHARED_RULES in config.local lists files outside the repo (absolute, ~/, or relative to its
+# root) that the snapshot carries, concatenated, at CT_SHARED_RULES_PATH for CI to put before the
+# prompt; prints one file's absolute path
+resolve_shared_rule() {
+  local p=$1 root=$2 path abs home
+  [[ $p =~ ^(/|~/)?[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+    || ct_die "SHARED_RULES in $CT_CONF_LOCAL_PATH must list absolute, ~/ or repo-root-relative paths ([A-Za-z0-9._-] segments), got: $p"
+  case $p in
+    /*) path=$p ;;
+    "~/"*)
+      # like the repo root, $HOME itself may sit behind a symlink; only what's below it is checked
+      home="$(realpath -e -- "$HOME")" || ct_die "SHARED_RULES: can't resolve \$HOME ($HOME) for $p"
+      path="$home/${p#"~/"}"
+      ;;
+    *) path="$root/$p" ;;
+  esac
+  [[ -e $path ]] || ct_die "SHARED_RULES file not found: $p ($path)"
+  abs="$(realpath -e -- "$path")"
+  [[ $abs == "$(realpath -s -- "$path")" ]] || ct_die "SHARED_RULES path must not contain a symlink: $p"
   [[ -f $abs ]] || ct_die "SHARED_RULES file is not a regular file: $p"
-  [[ $abs != "$root"/* ]] || ct_die "SHARED_RULES must name a file outside the repository: $p"
-  git cat-file -e "HEAD:$CT_SHARED_RULES_PATH" 2>/dev/null \
-    && ct_die "$CT_SHARED_RULES_PATH is committed, but the runner uploads SHARED_RULES there; remove it"
+  [[ -r $abs ]] || ct_die "SHARED_RULES file is not readable: $p"
+  [[ $abs != "$root"/* ]] || ct_die "SHARED_RULES must name files outside the repository: $p"
   echo "$abs"
+}
+
+# SHARED_RULES is the only key config.local may set, and only there: committed, it would put one
+# machine's paths in git, and other keys there would make submit and CI disagree
+read_shared_rules() {
+  local root=$1 line
+  grep -q '^SHARED_RULES=' "$root/$CT_CONF_PATH" 2>/dev/null \
+    && ct_die "SHARED_RULES is machine-local; move it from $CT_CONF_PATH to $CT_CONF_LOCAL_PATH"
+  [[ -e $root/$CT_CONF_LOCAL_PATH || -L $root/$CT_CONF_LOCAL_PATH ]] || return 0
+  [[ -e $root/$CT_CONF_LOCAL_PATH ]] \
+    || ct_die "$CT_CONF_LOCAL_PATH is a symlink to a missing file ($(readlink -- "$root/$CT_CONF_LOCAL_PATH"))"
+  git check-ignore -q -- "$CT_CONF_LOCAL_PATH" \
+    || ct_die "$CT_CONF_LOCAL_PATH must be gitignored (and not committed); add 'config.local' to $CT_DIR/.gitignore"
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)= && ${BASH_REMATCH[1]} != SHARED_RULES ]] \
+      && ct_die "$CT_CONF_LOCAL_PATH may only set SHARED_RULES; put ${BASH_REMATCH[1]} in $CT_CONF_PATH"
+  done < "$root/$CT_CONF_LOCAL_PATH"
+  ct_conf_get "$root/$CT_CONF_LOCAL_PATH" SHARED_RULES
 }
 
 # runners before v1.13.0 don't drop the uploaded SHARED_RULES file, so it would land in the PR
@@ -261,16 +290,29 @@ check_runner_supports_shared_rules() {
     || ct_die "SHARED_RULES needs runner v1.13.0 or newer, but $wf pins ${ver:-an untagged or unknown runner}; delete it, rerun '$PROG init' from a newer runner checkout and push it"
 }
 
+# concatenates the rules files in order, adding a newline after any but the last that lacks one
+join_rules() {
+  local f prev=""
+  for f; do
+    [[ -z $prev || -z $(tail -c1 -- "$prev") ]] || echo
+    cat -- "$f" || return
+    prev=$f
+  done
+}
+
 # builds the snapshot tree in a throwaway index; prints the tree sha
 build_tree() {
-  local index=$1 base=$2 force=${3-} rules_file=${4-} rules_blob
+  local index=$1 base=$2 force=$3 rules_blob
+  shift 3
   rm -f "$index"
   GIT_INDEX_FILE="$index" git read-tree "$base"
   GIT_INDEX_FILE="$index" git add --all -- .
   [[ -z $force ]] || GIT_INDEX_FILE="$index" git add --force -- "$force"
-  if [[ -n $rules_file ]]; then
-    rules_blob="$(git hash-object -w -- "$rules_file")"
-    GIT_INDEX_FILE="$index" git update-index --add --cacheinfo "100644,$rules_blob,$CT_SHARED_RULES_PATH"
+  # errexit is off here (we run in a command substitution), so failures abort explicitly
+  if [[ $# -gt 0 ]]; then
+    rules_blob="$(join_rules "$@" | git hash-object -w --stdin)" || ct_die "reading the SHARED_RULES files failed"
+    GIT_INDEX_FILE="$index" git update-index --add --cacheinfo "100644,$rules_blob,$CT_SHARED_RULES_PATH" \
+      || ct_die "adding the SHARED_RULES files to the snapshot failed"
   fi
   GIT_INDEX_FILE="$index" git write-tree
 }
@@ -375,7 +417,8 @@ cmd_submit() {
   local root conf base_branch prefix workflow=$CT_WORKFLOW branch base_sha task_name task_id rel
   local force="" followup=0 remote_sha="" pr_line pr_state pr_num pr_title upstream
   local tree tree2 attempt snapshot_sha snapshot_ref result_branch slug changes nchanges
-  local rules rules_file="" changes_paths=(.)
+  local rules p changes_paths=(.)
+  local -a rules_list rules_files=()
 
   root="$(git rev-parse --show-toplevel)" || ct_die "not inside a git repository"
   root="$(realpath -e "$root")"
@@ -390,10 +433,13 @@ cmd_submit() {
   # reserved for the uploaded SHARED_RULES file; CI would drop a working-tree one from the PR
   [[ -e $CT_SHARED_RULES_PATH || -L $CT_SHARED_RULES_PATH ]] \
     && ct_die "$CT_SHARED_RULES_PATH is reserved for the SHARED_RULES upload; move or delete it"
-  rules="$(ct_conf_get "$conf" SHARED_RULES)"
+  rules="$(read_shared_rules "$root")"
   if [[ -n $rules ]]; then
     check_runner_supports_shared_rules ".github/workflows/$workflow"
-    rules_file="$(resolve_shared_rules "$rules" "$root")"
+    read -ra rules_list <<< "$rules"
+    for p in "${rules_list[@]}"; do rules_files+=("$(resolve_shared_rule "$p" "$root")"); done
+    git cat-file -e "HEAD:$CT_SHARED_RULES_PATH" 2>/dev/null \
+      && ct_die "$CT_SHARED_RULES_PATH is committed, but the runner uploads SHARED_RULES there; remove it"
     changes_paths+=(":(exclude)$CT_SHARED_RULES_PATH")
   fi
 
@@ -455,8 +501,8 @@ cmd_submit() {
   # build twice and compare, so a file changing mid-snapshot is caught instead of half-captured
   for attempt in 1 2 3; do
     base_sha="$(git rev-parse --verify HEAD^{commit})"
-    tree="$(build_tree "$tmp/index" "$base_sha" "$force" "$rules_file")"
-    tree2="$(build_tree "$tmp/index" "$base_sha" "$force" "$rules_file")"
+    tree="$(build_tree "$tmp/index" "$base_sha" "$force" ${rules_files[@]+"${rules_files[@]}"})"
+    tree2="$(build_tree "$tmp/index" "$base_sha" "$force" ${rules_files[@]+"${rules_files[@]}"})"
     [[ $tree == "$tree2" && $(git rev-parse HEAD) == "$base_sha" ]] && break
     [[ $attempt -eq 3 ]] && ct_die "the working tree kept changing while the snapshot was built; retry once it's idle"
     sleep 1

@@ -42,7 +42,7 @@ sandbox() {
   ln -s a.txt link
   echo 'name: claude task' > .github/workflows/claude-task.yml
   printf 'PROTECTED_PATHS=guarded/\nCLAUDE_MAX_BUDGET_USD=1\nWORKTREE_LINKS=ignored\n' > .claude-task/config
-  echo 'tasks/' > .claude-task/.gitignore
+  printf 'tasks/\nconfig.local\n' > .claude-task/.gitignore
   printf '#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p build && echo setup > build/setup.out\n${SETUP_EXTRA:-true}\n' > .claude-task/setup.sh
   printf '#!/usr/bin/env bash\nset -euo pipefail\ngrep -q . a.txt\n${VALIDATE_EXTRA:-true}\n' > .claude-task/validate.sh
   chmod +x .claude-task/setup.sh .claude-task/validate.sh
@@ -1107,6 +1107,7 @@ test_worktree_setup() {
   eq "$(readlink "$wt/build")" "$REPO/build" "directory link"
   [[ -f $wt/tool.sh && ! -L $wt/tool.sh ]] || die "replaced a tracked file"
   contains "$(cat "$SB/log")" "missing isn't in $REPO; not linked"
+  [[ ! -e $wt/.claude-task/config.local ]] || die "linked a config.local the main checkout lacks"
   eq "$(cat "$SB_WT_LOG")" "$REPO $wt" "worktree.sh"
   contains "$(cat "$SB/log")" "the link build isn't gitignored"
   eq "$(git -C "$wt" status --porcelain)" "?? build" "links not ignored"
@@ -1117,6 +1118,13 @@ test_worktree_setup() {
   eq "$(grep -c '' "$SB_WT_LOG")" 2 "hook ran on a plain checkout"
   out="$("$SUBMIT" worktree-setup 2>&1)" && die "set up the main checkout"
   contains "$out" "is the main checkout"
+
+  # config.local is gitignored, so it's always linked when the main checkout has one
+  echo 'SHARED_RULES=../r.md' > .claude-task/config.local
+  local wt2="$SB/wt2"
+  git worktree add -q -b wt2 "$wt2" 2> "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(readlink "$wt2/.claude-task/config.local")" "$REPO/.claude-task/config.local" "config.local link"
+  eq "$(git -C "$wt2" status --porcelain)" "?? build" "config.local link not ignored"
 
   printf 'WORKTREE_LINKS=../escape\n' > "$wt/.claude-task/config"
   out="$(cd "$wt" && "$SUBMIT" worktree-setup 2>&1)" && die "linked outside the repo"
@@ -1186,7 +1194,11 @@ test_ci_template_wraps_prompt() {
 test_ci_shared_rules() {
   sandbox
   printf '# Shared\nbe brief\n' > "$SB/CLAUDE.md"
-  echo 'SHARED_RULES=../CLAUDE.md' >> .claude-task/config
+  # $HOME behind a symlink (like /home -> var/home) is resolved, not rejected
+  mv "$HOME" "$SB/real-home" && ln -s real-home "$HOME"
+  # a file without a final newline gets one before the next file
+  printf 'home rule' > "$HOME/rules.md" && mkdir "$SB/abs" && echo 'abs rule' > "$SB/abs/r.md"
+  printf 'SHARED_RULES=../CLAUDE.md  ~/rules.md\t%s\n' "$SB/abs/r.md" > .claude-task/config.local
   pin_runner v1.13.0
   printf 'header\n{{task}}\n' > .claude-task/template.md
   git add -A && git commit -qm rules && git push -q origin main
@@ -1194,13 +1206,15 @@ test_ci_shared_rules() {
   local status_before
   status_before="$(GIT_OPTIONAL_LOCKS=0 git status --porcelain)"
   submit tasks/t.md
-  contains "$OUT" "rules:    ../CLAUDE.md"
+  contains "$OUT" "rules:    ../CLAUDE.md  ~/rules.md"
   contains "$OUT" "changes:  1 file(s) relative to HEAD (1 file changed, 1 insertion(+))"
-  cmp <(git show "$SNAP_SHA:.claude-task/shared-rules.md") "$SB/CLAUDE.md" || die "rules not in snapshot"
+  { cat "$SB/CLAUDE.md" "$HOME/rules.md"; echo; cat "$SB/abs/r.md"; } > "$SB/all.md"
+  cmp <(git show "$SNAP_SHA:.claude-task/shared-rules.md") "$SB/all.md" || die "rules not in snapshot"
+  fails git cat-file -e "$SNAP_SHA:.claude-task/config.local"
   eq "$(GIT_OPTIONAL_LOCKS=0 git status --porcelain)" "$status_before" "working tree changed"
   ci_env
   pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
-  eq "$(cat "$SB/claude-stdin")" $'# Shared\nbe brief\n\nheader\ndo it' "rules before the wrapped prompt"
+  eq "$(cat "$SB/claude-stdin")" $'# Shared\nbe brief\nhome rule\nabs rule\n\nheader\ndo it' "rules before the wrapped prompt"
   git fetch -q origin task-t
   fails git cat-file -e "FETCH_HEAD:.claude-task/shared-rules.md"
   eq "$(git diff --name-only HEAD FETCH_HEAD | tr '\n' ' ')" "a.txt c.txt src/new.txt " "PR diff vs main"
@@ -1209,7 +1223,7 @@ test_ci_shared_rules() {
   # a follow-up's base (the result branch) lacks the rules too, so they're uploaded again
   git checkout -q task-t
   submit tasks/t.md
-  cmp <(git show "$SNAP_SHA:.claude-task/shared-rules.md") "$SB/CLAUDE.md" || die "rules not in follow-up snapshot"
+  cmp <(git show "$SNAP_SHA:.claude-task/shared-rules.md") "$SB/all.md" || die "rules not in follow-up snapshot"
 }
 
 # pins the sandbox workflow to a runner release, as init writes it
@@ -1224,17 +1238,47 @@ test_shared_rules_rejected() {
   pin_runner v1.13.0
   mkdir -p "$SB/dir" "$SB/real" && echo x > "$SB/rules.md" && ln -s rules.md "$SB/link.md"
   echo x > "$SB/real/rules.md" && ln -s real "$SB/linkdir"
-  local p
-  for p in "$SB/rules.md:relative to the repo root" ../missing.md:"not found" ../link.md:"must not contain a symlink" \
-           ../linkdir/rules.md:"must not contain a symlink" ../dir:"not a regular file" \
-           a.txt:"outside the repository" "../x y.md:relative to the repo root"; do
-    printf 'SHARED_RULES=%s\n' "${p%:*}" > .claude-task/config
+  echo x > "$SB/unreadable.md" && chmod 000 "$SB/unreadable.md" && ln -s ../rules.md "$HOME/hl.md"
+  local p root charset='must list absolute, ~/ or repo-root-relative paths ([A-Za-z0-9._-] segments), got:'
+  root="$(realpath -e "$REPO")"
+  # every listed file is checked, not just the first; '|' separates the path from the full reason
+  for p in "../missing.md|SHARED_RULES file not found: ../missing.md ($root/../missing.md)" \
+           "../link.md|SHARED_RULES path must not contain a symlink: ../link.md" \
+           "../linkdir/rules.md|SHARED_RULES path must not contain a symlink: ../linkdir/rules.md" \
+           "~/hl.md|SHARED_RULES path must not contain a symlink: ~/hl.md" \
+           "../dir|SHARED_RULES file is not a regular file: ../dir" \
+           "../unreadable.md|SHARED_RULES file is not readable: ../unreadable.md" \
+           "a.txt|SHARED_RULES must name files outside the repository: a.txt" \
+           "~user/x.md|SHARED_RULES in .claude-task/config.local $charset ~user/x.md" \
+           'x/../$(id).md|SHARED_RULES in .claude-task/config.local '"$charset"' x/../$(id).md'; do
+    printf 'SHARED_RULES=../rules.md %s\n' "${p%|*}" > .claude-task/config.local
     fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
-    grep -q "${p##*:}" "$SB/log" || die "$p: $(cat "$SB/log")"
+    grep -qxF "claude-task: ${p#*|}" "$SB/log" || die "$p: $(cat "$SB/log")"
   done
 
-  # the pinned runner must drop the uploaded file again
+  # a config.local symlink whose target is gone (e.g. in a worktree) fails instead of being skipped
+  rm .claude-task/config.local && ln -s "$SB/gone" .claude-task/config.local
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  grep -qxF "claude-task: .claude-task/config.local is a symlink to a missing file ($SB/gone)" "$SB/log" \
+    || die "$(cat "$SB/log")"
+  rm .claude-task/config.local
+
+  # machine-local: never in the committed config; config.local sets nothing else and stays ignored
   echo 'SHARED_RULES=../rules.md' > .claude-task/config
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  grep -q "SHARED_RULES is machine-local; move it from .claude-task/config to .claude-task/config.local" "$SB/log" \
+    || die "$(cat "$SB/log")"
+  git checkout -q .claude-task/config
+  printf 'SHARED_RULES=../rules.md\nBASE_BRANCH=dev\n' > .claude-task/config.local
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  grep -q "may only set SHARED_RULES; put BASE_BRANCH in .claude-task/config" "$SB/log" || die "$(cat "$SB/log")"
+  echo 'SHARED_RULES=../rules.md' > .claude-task/config.local
+  echo 'tasks/' > .claude-task/.gitignore
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  grep -q "config.local must be gitignored" "$SB/log" || die "$(cat "$SB/log")"
+  git checkout -q .claude-task/.gitignore
+
+  # the pinned runner must drop the uploaded file again
   for p in v1.9.0 untagged; do
     pin_runner "$p"
     fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
@@ -1245,12 +1289,12 @@ test_shared_rules_rejected() {
   # the reserved path, set or not: a working-tree file there would be uploaded and dropped
   echo mine > .claude-task/shared-rules.md
   for p in 'SHARED_RULES=../rules.md' ''; do
-    printf '%s\n' "$p" > .claude-task/config
+    printf '%s\n' "$p" > .claude-task/config.local
     fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
     grep -q "is reserved for the SHARED_RULES upload" "$SB/log" || die "'$p': $(cat "$SB/log")"
   done
   git add -A && git commit -qm reserved && rm .claude-task/shared-rules.md
-  echo 'SHARED_RULES=../rules.md' > .claude-task/config
+  echo 'SHARED_RULES=../rules.md' > .claude-task/config.local
   fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
   grep -q "is committed" "$SB/log" || die "$(cat "$SB/log")"
   eq "$(snap)" "" "nothing pushed"
@@ -1259,17 +1303,34 @@ test_shared_rules_rejected() {
 test_shared_rules_changing_mid_submit() {
   sandbox
   pin_runner v1.13.0
-  echo 'SHARED_RULES=../rules.md' >> .claude-task/config
   git add -A && git commit -qm rules && git push -q origin main
+  echo 'SHARED_RULES=../rules.md' > .claude-task/config.local
   echo x > tasks/t.md
   echo 1 > "$SB/rules.md"
-  # every hash of the rules file sees new content
-  printf '#!/usr/bin/env bash\n[[ $1 == hash-object && $* == *rules.md ]] && date +%%s%%N > %q\nexec %q "$@"\n' \
-    "$SB/rules.md" "$(command -v git)" > "$SB/bin/git"
+  # every hash of the rules files sees new content
+  printf '#!/usr/bin/env bash\n%q "$@" || exit\n[[ $1 == hash-object && $* == *--stdin ]] && date +%%s%%N > %q\nexit 0\n' \
+    "$(command -v git)" "$SB/rules.md" > "$SB/bin/git"
   chmod +x "$SB/bin/git"
   fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
   rm "$SB/bin/git"
   grep -q "kept changing" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(snap)" "" "nothing pushed"
+}
+
+# a rules file that turns unreadable after the checks fails the submit instead of being cut short
+test_shared_rules_unreadable_mid_submit() {
+  sandbox
+  pin_runner v1.13.0
+  git add -A && git commit -qm rules && git push -q origin main
+  echo 'SHARED_RULES=../rules.md ../second.md' > .claude-task/config.local
+  echo x > tasks/t.md
+  echo 1 > "$SB/rules.md" && echo 2 > "$SB/second.md"
+  printf '#!/usr/bin/env bash\n[[ $1 == read-tree ]] && chmod 000 %q\nexec %q "$@"\n' \
+    "$SB/second.md" "$(command -v git)" > "$SB/bin/git"
+  chmod +x "$SB/bin/git"
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  rm "$SB/bin/git"
+  grep -qxF "claude-task: reading the SHARED_RULES files failed" "$SB/log" || die "$(cat "$SB/log")"
   eq "$(snap)" "" "nothing pushed"
 }
 
@@ -1354,6 +1415,7 @@ test_init() {
   grep -q '@[A-Z_]*@' .github/workflows/claude-task.yml && die "unfilled placeholder"
   echo '# t' > .claude-task/tasks/x.md
   git check-ignore -q .claude-task/tasks/x.md || die "tasks not ignored"
+  git check-ignore -q .claude-task/config.local || die "config.local not ignored"
   echo custom > .claude-task/validate.sh
   out="$("$runner/bin/submit-task" init 2>&1)"
   contains "$out" "kept     .claude-task/validate.sh"

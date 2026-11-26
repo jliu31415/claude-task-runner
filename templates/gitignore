@@ -2,3 +2,5 @@
 tasks/
 # handoff notes that `submit-task continue` downloads from a task's run
 handoff/
+# machine-local settings such as SHARED_RULES; submit-task reads it, it's never committed
+config.local
