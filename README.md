@@ -47,6 +47,7 @@ Optional `.claude-task/config` keys:
 | `BASE_BRANCH` | `main` | Branch you submit from, the workflow runs on and PRs target |
 | `RESULT_BRANCH_PREFIX` | `task-` | Result branch is `<prefix><task-name>` |
 | `PROTECTED_PATHS` | empty | Extra paths Claude must not change (trailing `/` = directory) |
+| `SHARED_RULES` | none | A file outside the repo, relative to its root (e.g. `../CLAUDE.md`), put before every prompt; see [Prompt template](#prompt-template) |
 | `CLAUDE_MAX_BUDGET_USD` | `10` | Passed as `--max-budget-usd` |
 | `CLAUDE_MODEL` | Claude Code default | Passed as `--model` |
 | `SETUP_ATTEMPTS` | `2` | Times `setup.sh` runs before the task fails, 30s apart, doubling; it must be safe to rerun |
@@ -181,6 +182,16 @@ Style: keep changes minimal; comments only where they explain intent.
 The template is read from the snapshot, so local edits apply to the next task you submit. The PR
 body shows the prompt alone.
 
+Rules shared by several repos, such as a `CLAUDE.md` in their parent folder that local Claude Code
+sessions load but a CI checkout of one repo lacks, can come along too: set `SHARED_RULES` to the
+file's path relative to the repo root, e.g. `SHARED_RULES=../CLAUDE.md`. `submit-task` reads it
+at submit time and the snapshot carries it as `.claude-task/shared-rules.md`; Claude gets its
+content first, then the wrapped prompt. Like an uploaded prompt it's absent from the PR's final
+tree but stays in the result branch's history (see [What the PR contains](#what-the-pr-contains)).
+The file must be a regular file outside the repo, with no symlink anywhere in its path; anything
+else fails the submit, as does any file of your own at `.claude-task/shared-rules.md`. It needs
+runner v1.13.0 or newer pinned in the workflow, since older runners would put the file in the PR.
+
 ### Setup environment
 
 Your local gitignored env files never reach the runner, since the snapshot leaves ignored files
@@ -266,6 +277,7 @@ delete `.github/workflows/claude-task.yml`, rerun `submit-task init` and commit 
    - symlinks
    - untracked non-ignored files
    - the prompt
+   - the `SHARED_RULES` file, if set
 
    Other ignored files are left out. A prompt from the gitignored `.claude-task/tasks/` is
    included explicitly; ignored prompts anywhere else are rejected. The snapshot's parent is
@@ -307,7 +319,9 @@ them are what runs, but Claude can't change them.
 ### What the PR contains
 
 The result branch is the snapshot plus one commit with Claude's changes. If the prompt wasn't
-already committed in `HEAD`, that commit also removes it again, so prompts never land in the PR.
+already committed in `HEAD`, that commit also removes it again, as it does the `SHARED_RULES`
+file, so neither is in the PR's final tree. Both stay in the snapshot commit in the branch's
+history, though, so squash-merge such PRs to keep them out of your base branch's history.
 Claude writes the commit message, which is also the PR title; if its report lacks the `Commit:`
 line, the run warns and uses `claude task <task-name>` instead. The message ends with `Task:`,
 `Prompt:`, `Snapshot:` and `Run:` trailers. The PR body ends with the same lines, so a squash

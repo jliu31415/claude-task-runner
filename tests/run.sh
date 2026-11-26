@@ -1183,6 +1183,96 @@ test_ci_template_wraps_prompt() {
   grep -q "must have exactly one {{task}} line (found 0)" "$SB/log" || die "$(cat "$SB/log")"
 }
 
+test_ci_shared_rules() {
+  sandbox
+  printf '# Shared\nbe brief\n' > "$SB/CLAUDE.md"
+  echo 'SHARED_RULES=../CLAUDE.md' >> .claude-task/config
+  pin_runner v1.13.0
+  printf 'header\n{{task}}\n' > .claude-task/template.md
+  git add -A && git commit -qm rules && git push -q origin main
+  echo 'do it' > tasks/t.md
+  local status_before
+  status_before="$(GIT_OPTIONAL_LOCKS=0 git status --porcelain)"
+  submit tasks/t.md
+  contains "$OUT" "rules:    ../CLAUDE.md"
+  contains "$OUT" "changes:  1 file(s) relative to HEAD (1 file changed, 1 insertion(+))"
+  cmp <(git show "$SNAP_SHA:.claude-task/shared-rules.md") "$SB/CLAUDE.md" || die "rules not in snapshot"
+  eq "$(GIT_OPTIONAL_LOCKS=0 git status --porcelain)" "$status_before" "working tree changed"
+  ci_env
+  pipeline > "$SB/log" 2>&1 || { cat "$SB/log"; die "pipeline failed"; }
+  eq "$(cat "$SB/claude-stdin")" $'# Shared\nbe brief\n\nheader\ndo it' "rules before the wrapped prompt"
+  git fetch -q origin task-t
+  fails git cat-file -e "FETCH_HEAD:.claude-task/shared-rules.md"
+  eq "$(git diff --name-only HEAD FETCH_HEAD | tr '\n' ' ')" "a.txt c.txt src/new.txt " "PR diff vs main"
+  grep -qF "| \`.claude-task/shared-rules.md\`" "$SB/out/pr-body.md" && die "files table lists the rules file"
+
+  # a follow-up's base (the result branch) lacks the rules too, so they're uploaded again
+  git checkout -q task-t
+  submit tasks/t.md
+  cmp <(git show "$SNAP_SHA:.claude-task/shared-rules.md") "$SB/CLAUDE.md" || die "rules not in follow-up snapshot"
+}
+
+# pins the sandbox workflow to a runner release, as init writes it
+pin_runner() {
+  printf '    uses: test/runner/.github/workflows/claude-task-run.yml@%s # %s\n' "$(printf '%040d' 0)" "$1" \
+    > .github/workflows/claude-task.yml
+}
+
+test_shared_rules_rejected() {
+  sandbox
+  echo x > tasks/t.md
+  pin_runner v1.13.0
+  mkdir -p "$SB/dir" "$SB/real" && echo x > "$SB/rules.md" && ln -s rules.md "$SB/link.md"
+  echo x > "$SB/real/rules.md" && ln -s real "$SB/linkdir"
+  local p
+  for p in "$SB/rules.md:relative to the repo root" ../missing.md:"not found" ../link.md:"must not contain a symlink" \
+           ../linkdir/rules.md:"must not contain a symlink" ../dir:"not a regular file" \
+           a.txt:"outside the repository" "../x y.md:relative to the repo root"; do
+    printf 'SHARED_RULES=%s\n' "${p%:*}" > .claude-task/config
+    fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+    grep -q "${p##*:}" "$SB/log" || die "$p: $(cat "$SB/log")"
+  done
+
+  # the pinned runner must drop the uploaded file again
+  echo 'SHARED_RULES=../rules.md' > .claude-task/config
+  for p in v1.9.0 untagged; do
+    pin_runner "$p"
+    fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+    grep -q "needs runner v1.13.0 or newer.*rerun 'submit-task init'" "$SB/log" || die "$p: $(cat "$SB/log")"
+  done
+  pin_runner v1.13.0
+
+  # the reserved path, set or not: a working-tree file there would be uploaded and dropped
+  echo mine > .claude-task/shared-rules.md
+  for p in 'SHARED_RULES=../rules.md' ''; do
+    printf '%s\n' "$p" > .claude-task/config
+    fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+    grep -q "is reserved for the SHARED_RULES upload" "$SB/log" || die "'$p': $(cat "$SB/log")"
+  done
+  git add -A && git commit -qm reserved && rm .claude-task/shared-rules.md
+  echo 'SHARED_RULES=../rules.md' > .claude-task/config
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  grep -q "is committed" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(snap)" "" "nothing pushed"
+}
+
+test_shared_rules_changing_mid_submit() {
+  sandbox
+  pin_runner v1.13.0
+  echo 'SHARED_RULES=../rules.md' >> .claude-task/config
+  git add -A && git commit -qm rules && git push -q origin main
+  echo x > tasks/t.md
+  echo 1 > "$SB/rules.md"
+  # every hash of the rules file sees new content
+  printf '#!/usr/bin/env bash\n[[ $1 == hash-object && $* == *rules.md ]] && date +%%s%%N > %q\nexec %q "$@"\n' \
+    "$SB/rules.md" "$(command -v git)" > "$SB/bin/git"
+  chmod +x "$SB/bin/git"
+  fails "$SUBMIT" --yes tasks/t.md > "$SB/log" 2>&1
+  rm "$SB/bin/git"
+  grep -q "kept changing" "$SB/log" || die "$(cat "$SB/log")"
+  eq "$(snap)" "" "nothing pushed"
+}
+
 test_tasks_folder_prompt() {
   sandbox
   mkdir -p .claude-task/tasks

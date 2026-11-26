@@ -49,16 +49,25 @@ protected_paths() {
   echo "$CT_DEFAULT_PROTECTED $(conf PROTECTED_PATHS)"
 }
 
-# A prompt that isn't in the snapshot's parent was uploaded only to carry the task (typically from
-# the gitignored tasks folder), so the result drops it again rather than adding it to the PR.
-prompt_is_uploaded() {
-  ! git -C "$CT_WORK" cat-file -e "$CT_SNAPSHOT_SHA^:$CT_PROMPT_PATH" 2>/dev/null
+# The prompt (typically from the gitignored tasks folder) or the SHARED_RULES file, when the
+# snapshot has it and its parent doesn't, was uploaded only to carry the task, so the result drops
+# it again rather than adding it to the PR.
+is_uploaded() {
+  git -C "$CT_WORK" cat-file -e "$CT_SNAPSHOT_SHA:$1" 2>/dev/null \
+    && ! git -C "$CT_WORK" cat-file -e "$CT_SNAPSHOT_SHA^:$1" 2>/dev/null
 }
 
-# paths changed between the snapshot and tree, minus the dropped prompt
+uploaded_paths() {
+  local p
+  for p in "$CT_PROMPT_PATH" "$CT_SHARED_RULES_PATH"; do
+    if is_uploaded "$p"; then echo "$p"; fi
+  done
+}
+
+# paths changed between the snapshot and tree, minus the dropped uploads
 claude_changes() {
   git -C "$CT_WORK" diff --name-only --no-renames "$CT_SNAPSHOT_SHA" "$1" \
-    | { if prompt_is_uploaded; then grep -vxF -- "$CT_PROMPT_PATH" || true; else cat; fi; }
+    | { grep -vxF -f <(uploaded_paths) || true; }
 }
 
 check_changes() {
@@ -137,6 +146,15 @@ apply_template() {
   echo "wrapped the prompt in $CT_TEMPLATE_PATH"
 }
 
+# the uploaded SHARED_RULES file (see submit-task) goes before the wrapped prompt
+apply_shared_rules() {
+  is_uploaded "$CT_SHARED_RULES_PATH" || return 0
+  snapshot_regular_file "$CT_SHARED_RULES_PATH" || ct_die "$CT_SHARED_RULES_PATH is not a regular file in the snapshot"
+  { git -C "$CT_WORK" cat-file blob "HEAD:$CT_SHARED_RULES_PATH"; echo; cat "$CT_OUT/prompt.md"; } > "$CT_OUT/prompt.tmp"
+  mv "$CT_OUT/prompt.tmp" "$CT_OUT/prompt.md"
+  echo "put the shared rules ($CT_SHARED_RULES_PATH) before the prompt"
+}
+
 phase_verify() {
   check_inputs
   check_head
@@ -148,6 +166,7 @@ phase_verify() {
   [[ -s $CT_OUT/task.md ]] || ct_die "prompt $CT_PROMPT_PATH is empty"
   cp "$CT_OUT/task.md" "$CT_OUT/prompt.md"
   apply_template
+  apply_shared_rules
   [[ -z $(git -C "$CT_WORK" status --porcelain --untracked-files=all) ]] \
     || ct_die "snapshot checkout is not clean"
   echo "snapshot $CT_SNAPSHOT_SHA verified; prompt $CT_PROMPT_PATH ($(wc -c < "$CT_OUT/prompt.md") bytes)"
@@ -518,7 +537,7 @@ phase_claude() {
 collect_changes() {
   local tree n
   check_head
-  prompt_is_uploaded && rm -f "$CT_WORK/$CT_PROMPT_PATH"
+  uploaded_paths | while IFS= read -r path; do rm -f "$CT_WORK/$path"; done
   tree="$(worktree_tree)"
   check_gitlinks "$tree"
   check_submodules_unchanged "$tree"
@@ -591,14 +610,15 @@ md_cell() { local s=${1//|/\\|}; printf '%s' "${s//$'\n'/ }"; }
 
 # git's per-file line counts joined with Claude's note for each file; a missing note is flagged
 files_table() {
-  local old=$1 new=$2 adds dels path st note count
+  local old=$1 new=$2 adds dels path st note count uploaded
   local -A notes=() status=()
+  uploaded=" $(uploaded_paths | tr '\n' ' ') "
   while IFS=$'\t' read -r path note; do notes[$path]=$note; done < <(report_file_notes)
   while IFS=$'\t' read -r st path; do status[$path]=$st; done < <(git diff --name-status --no-renames "$old" "$new")
   echo '| File | +/− | Change |'
   echo '|---|---|---|'
   while IFS=$'\t' read -r adds dels path; do
-    [[ $path == "$CT_PROMPT_PATH" ]] && prompt_is_uploaded && continue
+    [[ $uploaded == *" $path "* ]] && continue
     if [[ $adds == - ]]; then count=binary; else count="+$adds −$dels"; fi
     case "${status[$path]-}" in
       A) count+=" (new)" ;;

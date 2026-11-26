@@ -9,6 +9,8 @@ CT_TASKS_DIR=$CT_DIR/tasks
 CT_SETUP_PATH=$CT_DIR/setup.sh
 CT_VALIDATE_PATH=$CT_DIR/validate.sh
 CT_TEMPLATE_PATH=$CT_DIR/template.md
+# where the snapshot carries the SHARED_RULES file from outside the repo
+CT_SHARED_RULES_PATH=$CT_DIR/shared-rules.md
 CT_WORKTREE_SETUP_PATH=$CT_DIR/worktree.sh
 CT_WORKFLOW=claude-task.yml
 
